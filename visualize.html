@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Skeleton Visualization</title>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #fff; }
+        #container { display: flex; flex-direction: column; height: 100vh; }
+        #header { padding: 15px 30px; background-color: #1e1e1e; box-shadow: 0 2px 10px rgba(0,0,0,0.5); z-index: 10; display: flex; justify-content: space-between; align-items: center; }
+        h1 { margin: 0; font-size: 1.5rem; color: #bb86fc; }
+        #controls { padding: 20px 30px; background-color: #1e1e1e; border-top: 1px solid #333; z-index: 10; }
+        .slider-container { display: flex; align-items: center; gap: 15px; }
+        input[type=range] { flex-grow: 1; accent-color: #bb86fc; }
+        #frame-display { font-variant-numeric: tabular-nums; width: 120px; font-weight: bold; }
+        #plot { flex-grow: 1; width: 100%; position: relative; }
+        .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2rem; color: #888; text-align: center;}
+        .btn { background-color: #bb86fc; color: #000; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
+        .btn:hover { background-color: #d0a9f5; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="header">
+            <h1>Kinematic Fusion - 3D Skeleton</h1>
+        </div>
+        <div id="plot">
+            <div id="loading" class="loading">Loading data...<br><span style="font-size: 0.9em; color:#555;">(Python スクリプトから自動生成された visualize_data.js を読み込みます)</span></div>
+        </div>
+        <div id="controls">
+            <div class="slider-container">
+                <button id="play-btn" class="btn">Play</button>
+                <label for="time-slider">Frame:</label>
+                <input type="range" id="time-slider" min="0" max="0" value="0">
+                <span id="frame-display">0 / 0</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 自動生成されたデータファイルを動的に読み込む -->
+    <script>
+        let animationId = null;
+        let isPlaying = false;
+        let numFrames = 0;
+
+        // 間引き (--step) 後も元のフレーム番号を表示する
+        function frameLabel(idx) {
+            const fi = skeletonData.frame_indices;
+            if (!fi) return `${idx} / ${numFrames - 1}`;
+            return `${fi[idx]} / ${fi[numFrames - 1]}`;
+        }
+
+        function initApp() {
+            try {
+                if (typeof skeletonData === 'undefined') {
+                    throw new Error("skeletonData is not defined. Tests may need to be run first.");
+                }
+                
+                numFrames = skeletonData.pred_pos_flat.length;
+                
+                if (numFrames === 0) {
+                    throw new Error("skeletonData is empty.");
+                }
+
+                // Initialize UI
+                document.getElementById('time-slider').max = numFrames - 1;
+                document.getElementById('frame-display').innerText = frameLabel(0);
+                document.getElementById('loading').style.display = 'none';
+                
+                // Setup plot
+                setupPlot();
+                updatePlot(0);
+                
+            } catch (error) {
+                console.error('Error loading data:', error);
+                document.getElementById('loading').innerText = 'Error: ' + error.message + '\n\npython test.py を実行してデータを生成してください。';
+                document.getElementById('loading').style.color = '#ff6b6b';
+            }
+        }
+
+        function extractCoords(joints) {
+            let x = [], y = [], z = [];
+            for (let i = 0; i < joints.length; i++) {
+                x.push(joints[i][0]);
+                y.push(joints[i][1]);
+                z.push(joints[i][2]);
+            }
+            return {x, y, z};
+        }
+
+                function extractBones(joints) {
+            const kinematic_tree = [
+                [0, 1], [1, 2], [2, 3],           // Spine to Head
+                [2, 4], [4, 5], [5, 6],           // Left Arm
+                [2, 7], [7, 8], [8, 9],           // Right Arm
+                [0, 10], [10, 11], [11, 12], [12, 13], // Left Leg
+                [0, 14], [14, 15], [15, 16], [16, 17]  // Right Leg
+            ];
+            
+            let bx = [], by = [], bz = [];
+            for (let i = 0; i < kinematic_tree.length; i++) {
+                const parent = kinematic_tree[i][0];
+                const child = kinematic_tree[i][1];
+                bx.push(joints[parent][0], joints[child][0], null);
+                by.push(joints[parent][1], joints[child][1], null);
+                bz.push(joints[parent][2], joints[child][2], null);
+            }
+            return {x: bx, y: by, z: bz};
+        }
+
+        // visualize.py が出力した bounds を使う。無い場合は全フレームから算出する。
+        function getGlobalBounds() {
+            if (skeletonData.bounds) return skeletonData.bounds;
+            const mins = [Infinity, Infinity, Infinity];
+            const maxs = [-Infinity, -Infinity, -Infinity];
+            for (const frames of [skeletonData.pred_pos_flat, skeletonData.gt_pos_flat]) {
+                for (const joints of frames) {
+                    for (const p of joints) {
+                        for (let i = 0; i < 3; i++) {
+                            const v = p[i];
+                            if (v === null || Number.isNaN(v)) continue;
+                            if (v < mins[i]) mins[i] = v;
+                            if (v > maxs[i]) maxs[i] = v;
+                        }
+                    }
+                }
+            }
+            const b = {};
+            ['x', 'y', 'z'].forEach((k, i) => {
+                let pad = (maxs[i] - mins[i]) * 0.1;
+                if (!(pad > 0)) pad = 1.0;
+                b[k] = [mins[i] - pad, maxs[i] + pad];
+            });
+            return b;
+        }
+
+        function setupPlot() {
+            const predPos = skeletonData.pred_pos_flat[0];
+            const gtPos = skeletonData.gt_pos_flat[0];
+            
+            const predCoords = extractCoords(predPos);
+            const gtCoords = extractCoords(gtPos);
+            const predBones = extractBones(predPos);
+            const gtBones = extractBones(gtPos);
+            
+            // 全フレーム共通の固定範囲・固定縦横比を使う。
+            // aspectmode "data" はフレームごとのデータの広がりから縦横比を再計算するため、
+            // しゃがむ・腕を広げる等でスケルトンのスケールが変化してしまう。
+            const bounds = getGlobalBounds();
+            const span = {
+                x: bounds.x[1] - bounds.x[0],
+                y: bounds.y[1] - bounds.y[0],
+                z: bounds.z[1] - bounds.z[0]
+            };
+            const maxSpan = Math.max(span.x, span.y, span.z);
+            const axisCommon = { mirror: false, showgrid: true, zeroline: true, showline: false, autorange: false };
+
+            const layout = {
+                margin: { l: 0, r: 0, b: 0, t: 0 },
+                uirevision: 'fixed',  // フレーム更新時にカメラ・ズームを保持
+                scene: {
+                    aspectmode: "manual",
+                    aspectratio: { x: span.x / maxSpan, y: span.y / maxSpan, z: span.z / maxSpan },
+                    xaxis: { ...axisCommon, title: 'X', range: bounds.x },
+                    yaxis: { ...axisCommon, title: 'Y', range: bounds.y },
+                    zaxis: { ...axisCommon, title: 'Z', range: bounds.z },
+                    camera: {
+                        eye: {x: 1.5, y: 1.5, z: 1.5}
+                    }
+                },
+                paper_bgcolor: '#121212',
+                plot_bgcolor: '#121212',
+                font: { color: '#ffffff' },
+                showlegend: true,
+                legend: {
+                    x: 0,
+                    y: 1,
+                    bgcolor: 'rgba(0,0,0,0.5)'
+                }
+            };
+            
+            const traces = [
+                {
+                    x: predCoords.x, y: predCoords.y, z: predCoords.z,
+                    mode: 'markers',
+                    type: 'scatter3d',
+                    name: 'Predicted (Joints)',
+                    marker: { size: 6, color: '#03dac6', opacity: 0.8 }
+                },
+                {
+                    x: predBones.x, y: predBones.y, z: predBones.z,
+                    mode: 'lines',
+                    type: 'scatter3d',
+                    name: 'Predicted (Bones)',
+                    line: { color: '#03dac6', width: 4 },
+                    hoverinfo: 'none',
+                    showlegend: false
+                },
+                {
+                    x: gtCoords.x, y: gtCoords.y, z: gtCoords.z,
+                    mode: 'markers',
+                    type: 'scatter3d',
+                    name: 'Ground Truth (Joints)',
+                    marker: { size: 6, color: '#cf6679', opacity: 0.5 }
+                },
+                {
+                    x: gtBones.x, y: gtBones.y, z: gtBones.z,
+                    mode: 'lines',
+                    type: 'scatter3d',
+                    name: 'Ground Truth (Bones)',
+                    line: { color: '#cf6679', width: 4, opacity: 0.5 },
+                    hoverinfo: 'none',
+                    showlegend: false
+                }
+            ];
+
+            Plotly.newPlot('plot', traces, layout, {responsive: true});
+        }
+
+        function updatePlot(frameIdx) {
+            const predPos = skeletonData.pred_pos_flat[frameIdx];
+            const gtPos = skeletonData.gt_pos_flat[frameIdx];
+            
+            const predCoords = extractCoords(predPos);
+            const gtCoords = extractCoords(gtPos);
+            const predBones = extractBones(predPos);
+            const gtBones = extractBones(gtPos);
+            
+            let plotDiv = document.getElementById('plot');
+            if (plotDiv.data && plotDiv.data.length === 4) {
+                plotDiv.data[0].x = predCoords.x;
+                plotDiv.data[0].y = predCoords.y;
+                plotDiv.data[0].z = predCoords.z;
+                
+                plotDiv.data[1].x = predBones.x;
+                plotDiv.data[1].y = predBones.y;
+                plotDiv.data[1].z = predBones.z;
+                
+                plotDiv.data[2].x = gtCoords.x;
+                plotDiv.data[2].y = gtCoords.y;
+                plotDiv.data[2].z = gtCoords.z;
+                
+                plotDiv.data[3].x = gtBones.x;
+                plotDiv.data[3].y = gtBones.y;
+                plotDiv.data[3].z = gtBones.z;
+                
+                Plotly.react('plot', plotDiv.data, plotDiv.layout);
+            } else {
+                // Fallback inside update
+                Plotly.react('plot', [{x: predCoords.x, y: predCoords.y, z: predCoords.z}], plotDiv.layout);
+            }
+        }
+
+        // Event Listeners
+        document.getElementById('time-slider').addEventListener('input', (e) => {
+            const frame = parseInt(e.target.value);
+            document.getElementById('frame-display').innerText = frameLabel(frame);
+            updatePlot(frame);
+        });
+
+        document.getElementById('play-btn').addEventListener('click', () => {
+            isPlaying = !isPlaying;
+            document.getElementById('play-btn').innerText = isPlaying ? 'Pause' : 'Play';
+            if (isPlaying) {
+                playAnimation();
+            } else {
+                cancelAnimationFrame(animationId);
+            }
+        });
+
+        function playAnimation() {
+            let slider = document.getElementById('time-slider');
+            let currentFrame = parseInt(slider.value);
+            
+            if (currentFrame >= numFrames - 1) {
+                currentFrame = 0;
+            } else {
+                currentFrame++;
+            }
+            
+            slider.value = currentFrame;
+            document.getElementById('frame-display').innerText = frameLabel(currentFrame);
+            updatePlot(currentFrame);
+            
+            if (isPlaying) {
+                // Approximate 30 fps
+                setTimeout(() => {
+                    animationId = requestAnimationFrame(playAnimation);
+                }, 33);
+            }
+        }
+
+        // データを動的に読み込み、完了後に initApp を実行
+        window.addEventListener('load', () => {
+            const script = document.createElement('script');
+            // 読み込むデータは visualize.py が URL の ?data= で指定する
+            const dataSrc = new URLSearchParams(location.search).get('data') || 'outputs/results/visualize_data.js';
+            script.src = dataSrc + '?t=' + Date.now();
+            script.onload = () => {
+                if (typeof Plotly === 'undefined') {
+                    document.getElementById('loading').innerText = 'Error: Plotly が読み込めません。インターネット接続を確認してください。';
+                    document.getElementById('loading').style.color = '#ff6b6b';
+                    return;
+                }
+                initApp();
+            };
+            script.onerror = () => {
+                document.getElementById('loading').innerText = 'Error: visualize_data.js の読み込みに失敗しました。';
+                document.getElementById('loading').style.color = '#ff6b6b';
+            };
+            document.body.appendChild(script);
+        });
+    </script>
+</body>
+</html>

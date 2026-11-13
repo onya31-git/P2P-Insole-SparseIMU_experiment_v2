@@ -1,0 +1,66 @@
+# 入出力パス (相対パスはプロジェクトルート基準)
+#   出力ファイルの内訳は README.md / utils/paths.py を参照
+paths:
+  data_dir: "data"        # sensor/ と skeleton/ を含むフォルダ
+  output_dir: "outputs"   # 学習済み重み・同期結果・予測・評価の保存先
+
+dataset:
+  seq_len: 200
+  num_workers: 0
+
+# センサーと mocap の時刻同期 (収録ごとにオフセットを自動推定)
+#   センサー時刻 = スケルトン時刻 + offset_sec
+#   推定結果は outputs/sync/{train,test}.json に保存される
+sync:
+  enabled: true        # false にするとオフセット 0 (先頭合わせ)
+  max_lag_sec: 5.0     # 探索範囲 ±秒
+  min_corr: 0.3        # 推定相関がこれ未満なら警告
+  offsets: {}          # 手動指定 (自動推定より優先) 例: {D1S1A1: -0.70}
+
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  num_epochs: 100
+  cycle_loss_weight: 0.1
+
+test:
+  batch_size: 1
+
+model:
+  pressure_encoder:
+    num_sensors: 112     # 圧力センサー 8x14
+    in_channels: 1
+  imu_encoder:
+    in_features: 6       # Gyro 3 + Acc 3 (Mag は使わない)
+  foot_fusion:
+    embed_dim: 128
+  lower_body_net:
+    feature_dim: 128
+    body_param_dim: 8
+    hidden_dim: 256
+    num_layers: 2
+    nhead: 8
+    causal: False
+  upper_body_net:
+    feature_dim: 128
+    lower_latent_dim: 256
+    body_param_dim: 8
+    hidden_dim: 256
+    num_layers: 2
+  kinematic_fusion:
+    upper_dim: 256
+    lower_dim: 256
+  pose_decoder:
+    in_features: 512
+    num_joints: 18
+
+cycle_loss:
+  pressure_nodes: 112
+  imu_channels: 6
+
+losses:
+  pos: 1.0
+  rot: 1.0
+  bone: 0.5
+  contact: 0.1
+  smooth: 0.01
