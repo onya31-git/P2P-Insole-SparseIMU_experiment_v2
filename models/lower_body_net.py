@@ -53,7 +53,6 @@ class LowerBodyNet(nn.Module):
     """下半身スケルタル潜在表現を推定するネットワーク。
 
     時系列処理に Transformer Encoder を使用する。
-    旧 GRU ベースの処理は ``_forward_gru`` として保持されている。
 
     Parameters
     ----------
@@ -148,22 +147,6 @@ class LowerBodyNet(nn.Module):
         # ------------------------------------------------------------------ #
         self.causal = causal
 
-        # ------------------------------------------------------------------ #
-        # GRU版 (後方互換のために保持)                                          #
-        # ------------------------------------------------------------------ #
-        self._gru = nn.GRU(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-        )
-        self._gru_fc_out = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # *2 for bidirectional
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
     # ---------------------------------------------------------------------- #
     # ヘルパー: 因果マスク生成                                                  #
     # ---------------------------------------------------------------------- #
@@ -218,47 +201,6 @@ class LowerBodyNet(nn.Module):
 
         return lower_body_latent
 
-    # ---------------------------------------------------------------------- #
-    # Forward (旧 GRU版)                                                       #
-    # ---------------------------------------------------------------------- #
-    def _forward_gru(
-        self,
-        left_foot: torch.Tensor,
-        right_foot: torch.Tensor,
-        pelvis: torch.Tensor,
-        body_params: torch.Tensor,
-    ) -> torch.Tensor:
-        """旧アーキテクチャ (Bidirectional GRU) による順伝播。
-
-        Transformer 版と同一の入出力インターフェースを持つ。
-        比較実験や後方互換性のために残している。
-
-        Parameters
-        ----------
-        left_foot, right_foot, pelvis : Tensor  [B, T, feature_dim]
-        body_params : Tensor  [B, body_param_dim]
-
-        Returns
-        -------
-        lower_body_latent : Tensor  [B, T, hidden_dim]
-        """
-        B, T, _ = left_foot.shape
-
-        # 身体パラメータを時系列方向に拡張
-        bp_embed = self.body_param_embed(body_params)           # [B, feature_dim]
-        bp_embed = bp_embed.unsqueeze(1).expand(-1, T, -1)      # [B, T, feature_dim]
-
-        # 特徴量を結合
-        x = torch.cat([left_foot, right_foot, pelvis, bp_embed], dim=-1)  # [B, T, input_dim]
-
-        # Bidirectional GRU
-        out, _ = self._gru(x)                                   # [B, T, hidden_dim*2]
-
-        # 出力射影
-        lower_body_latent = self._gru_fc_out(out)               # [B, T, hidden_dim]
-
-        return lower_body_latent
-
 
 # ---------------------------------------------------------------------------
 # テスト
@@ -282,10 +224,6 @@ if __name__ == '__main__':
 
     latent_tf = model_tf(lf, rf, p, bp)
     print("Transformer LowerBodyLatent shape:", latent_tf.shape)   # [2, 64, 256]
-
-    # --- GRU版 (後方互換) ---
-    latent_gru = model_tf._forward_gru(lf, rf, p, bp)
-    print("GRU         LowerBodyLatent shape:", latent_gru.shape)  # [2, 64, 256]
 
     # --- 因果マスク版 ---
     model_causal = LowerBodyNet(

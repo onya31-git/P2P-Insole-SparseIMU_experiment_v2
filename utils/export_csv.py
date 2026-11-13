@@ -73,3 +73,14 @@ def export_rotations_to_csv(all_pred_rot, all_gt_rot, filename='predictions_rot.
     df = pd.DataFrame(combined, columns=columns)
     df.to_csv(filename, index=False)
     print(f"Saved rotations to {filename}")
+
+def export_contacts_to_csv(all_pred_contact, all_gt_contact, filename='predictions_contact.csv'):
+    """
+    接地の予測確率 (sigmoid 後) と正解ラベルを CSV に書き出す。
+    列: Pred_L, Pred_R (0〜1), GT_L, GT_R (0 or 1)
+    """
+    pred = np.array(all_pred_contact).reshape(-1, 2)
+    gt = np.array(all_gt_contact).reshape(-1, 2)
+    df = pd.DataFrame(np.hstack((pred, gt)), columns=['Pred_L', 'Pred_R', 'GT_L', 'GT_R'])
+    df.to_csv(filename, index=False)
+    print(f"Saved contacts to {filename}")

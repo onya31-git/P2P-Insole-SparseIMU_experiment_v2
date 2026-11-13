@@ -13,6 +13,7 @@
     └── results/
         ├── predictions_pos.csv 関節位置の予測と正解      (test.py)
         ├── predictions_rot.csv 関節回転の予測と正解      (test.py)
+        ├── predictions_contact.csv 接地の予測と正解      (test.py)
         ├── evaluation.txt      評価指標 (MPJPE 等)       (evaluate.py)
         └── visualize_data.js   可視化用データ            (visualize.py)
 
@@ -59,6 +60,7 @@ def get_paths(config, makedirs=False):
         sync_test=sync / 'test.json',
         pred_pos=results / 'predictions_pos.csv',
         pred_rot=results / 'predictions_rot.csv',
+        pred_contact=results / 'predictions_contact.csv',
         evaluation=results / 'evaluation.txt',
         visualize_data=results / 'visualize_data.js',
     )

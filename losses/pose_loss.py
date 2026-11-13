@@ -7,7 +7,7 @@ class PoseLoss(nn.Module):
     Computes multiple loss components for pose estimation:
     - Position (MPJPE / L1)
     - Rotation (L1 or Geodesic on 6D)
-    - Bone Length
+    - Bone Length (実寸 [mm] での骨長の相対誤差)
     - Foot Contact
     - Temporal Smoothness
     """
@@ -23,14 +23,18 @@ class PoseLoss(nn.Module):
         }
         self.bce = nn.BCEWithLogitsLoss()
         
-    def forward(self, pred_pos, gt_pos, pred_rot, gt_rot, pred_contact, gt_contact, kinematic_tree=None):
+    def forward(self, pred_pos, gt_pos, pred_rot, gt_rot, pred_contact, gt_contact, kinematic_tree=None,
+                pos_mean=None, pos_std=None):
         """
         Inputs:
-        pred_pos, gt_pos: [B, T, J, 3]
+        pred_pos, gt_pos: [B, T, J, 3]  正規化された位置
         pred_rot, gt_rot: [B, T, J, 6]
         pred_contact: [B, T, 2] # logits
         gt_contact: [B, T, 2]   # labels (0 or 1)
         kinematic_tree: list of tuples (parent_idx, child_idx) defining bones
+        pos_mean, pos_std: [B, J, 3]  位置の正規化統計量。骨長は pos * pos_std + pos_mean で
+                           実寸 [mm] に戻してから計算する (関節・軸ごとにスケールが異なる正規化空間では
+                           骨長が意味を持たないため)。kinematic_tree を渡す場合は必須。
         """
         # Position Loss (L1 MPJPE)
         loss_pos = F.l1_loss(pred_pos, gt_pos)
@@ -51,27 +55,19 @@ class PoseLoss(nn.Module):
         else:
             loss_smooth = torch.tensor(0.0, device=pred_pos.device)
             
-        # Bone Length Loss
+        # Bone Length Loss: 骨長の相対誤差 |L_pred - L_gt| / L_gt (実寸で計算するので単位に依存しない)
         loss_bone = torch.tensor(0.0, device=pred_pos.device)
         if kinematic_tree is not None:
-            bone_preds = []
-            bone_gts = []
-            for u, v in kinematic_tree:
-                # [B, T, 3]
-                bone_vec_pred = pred_pos[:, :, v, :] - pred_pos[:, :, u, :]
-                bone_len_pred = torch.norm(bone_vec_pred, p=2, dim=-1)
-                
-                bone_vec_gt = gt_pos[:, :, v, :] - gt_pos[:, :, u, :]
-                bone_len_gt = torch.norm(bone_vec_gt, p=2, dim=-1)
-                
-                bone_preds.append(bone_len_pred)
-                bone_gts.append(bone_len_gt)
-            
-            # [num_bones, B, T] -> [B, T, num_bones]
-            bone_preds = torch.stack(bone_preds, dim=-1)
-            bone_gts = torch.stack(bone_gts, dim=-1)
-            loss_bone = F.l1_loss(bone_preds, bone_gts)
-            
+            if pos_mean is None or pos_std is None:
+                raise ValueError("骨長の損失には pos_mean / pos_std (実寸に戻すための統計量) が必要です")
+            mean, std = pos_mean.unsqueeze(1), pos_std.unsqueeze(1)   # [B, 1, J, 3]
+            pred_mm, gt_mm = pred_pos * std + mean, gt_pos * std + mean
+            parents = [u for u, _ in kinematic_tree]
+            children = [v for _, v in kinematic_tree]
+            bone_pred = torch.norm(pred_mm[:, :, children] - pred_mm[:, :, parents], dim=-1)  # [B, T, num_bones]
+            bone_gt = torch.norm(gt_mm[:, :, children] - gt_mm[:, :, parents], dim=-1)
+            loss_bone = (torch.abs(bone_pred - bone_gt) / bone_gt.clamp(min=1.0)).mean()
+
         total_loss = (
             self.lambdas['pos'] * loss_pos + 
             self.lambdas['rot'] * loss_rot + 

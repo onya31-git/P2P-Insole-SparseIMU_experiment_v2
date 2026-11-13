@@ -52,7 +52,27 @@ JOINT_NAMES = [
     "RHipPositions", "RKneePositions", "RAnklePositions", "RToePositions",
 ]
 
+# 骨 (親関節, 子関節) の一覧。JOINT_NAMES のインデックス。骨長の損失と評価に使う
+KINEMATIC_TREE = [
+    (0, 1), (1, 2), (2, 3),
+    (2, 4), (4, 5), (5, 6),
+    (2, 7), (7, 8), (8, 9),
+    (0, 10), (10, 11), (11, 12), (12, 13),
+    (0, 14), (14, 15), (15, 16), (16, 17)
+]
+
+# スケルトンCSVで Angles 列がクオータニオンではなくヒンジ角になっている関節 (肘)
+HINGE_JOINTS = {"LElbowPositions", "RElbowPositions"}
+
 SKEL_FPS = 100.0
+
+# 接地ラベル (compute_foot_contact) の判定に使う関節と閾値
+FOOT_JOINTS = [("LAnklePositions", "LToePositions"), ("RAnklePositions", "RToePositions")]
+# 閾値はインソール圧力の合計 (足裏の物理的な接地) との一致度が最も高くなるように決めた
+# (一致率 91〜94%, Cohen's κ 0.70〜0.79; 高さは 15 mm が最良, 速さは 300 mm/s 以上でほぼ横ばい)
+CONTACT_HEIGHT_MARGIN = 15.0   # 床からの高さ [mm]
+CONTACT_SPEED_THRESH = 400.0   # 速さ [mm/s]
+
 # 同期推定に使う (センサー部位, スケルトン関節インデックス) の対応
 #   JOINT_NAMES の順序: 0 CoG, 6 LWrist, 9 RWrist, 12 LAnkle, 16 RAnkle
 SYNC_PAIRS = [('AL', 6), ('AR', 9), ('FL', 12), ('FR', 16), ('BC', 0)]
@@ -62,6 +82,51 @@ def subject_key(data_id):
     """'D1S1A2' -> 'D1S1'。正規化統計量はこのキー (データ収集回 x 被験者) 単位で持つ。"""
     m = SUBJECT_RE.match(data_id)
     return m.group(1).upper() if m else data_id
+
+
+def _hinge_to_quat(included_angle):
+    """
+    肘のヒンジ角をクオータニオン (W, X, Y, Z) に変換する。
+
+    スケルトンCSVの肘 (L/RElbowAngles) は 4 列のうち Y 列に
+    「上腕と前腕のなす角 [rad]」(伸展で π) が入っており、X, Z 列は常に 0、
+    W 列は屈曲に連動する別の量で、クオータニオンではない。
+    そこで屈曲角 θ = π - なす角 を求め、ローカル X 軸まわりの回転
+    q = (cos θ/2, sin θ/2, 0, 0) として表す。
+
+    ※ 回転軸 (X) は仮定。同じ軸まわりの回転同士の差は角度差だけで決まるため、
+      学習の損失・評価値には影響しない。
+    """
+    theta = np.pi - included_angle
+    q = np.zeros((len(theta), 4))
+    q[:, 0] = np.cos(theta / 2)
+    q[:, 1] = np.sin(theta / 2)
+    return q
+
+
+def compute_foot_contact(pos, height_margin=CONTACT_HEIGHT_MARGIN, speed_thresh=CONTACT_SPEED_THRESH):
+    """
+    mocap の足の動きから接地ラベルを作る。
+
+    左右それぞれ、かかと側 (足首) とつま先のどちらかが
+      「床から height_margin [mm] 以内の高さ」かつ「速さ speed_thresh [mm/s] 未満」
+    であれば接地 (1) とする。床の高さは収録ごと・関節ごとに、その収録中の
+    高さの 1 パーセンタイルとする (足首とつま先は床に着いても高さが異なるため)。
+
+    Parameters
+    ----------
+    pos : [T, J, 3]  グローバル座標の関節位置 [mm] (ルート相対化する前, y が鉛直)
+    戻り値 : [T, 2]  左足, 右足 (float, 0 or 1)
+    """
+    contact = np.zeros((len(pos), 2))
+    for side, joints in enumerate(FOOT_JOINTS):
+        for j in joints:
+            p = pos[:, JOINT_NAMES.index(j)]
+            floor = np.percentile(p[:, 1], 1)
+            speed = np.linalg.norm(np.gradient(p, axis=0), axis=1) * SKEL_FPS
+            on = (p[:, 1] < floor + height_margin) & (speed < speed_thresh)
+            contact[:, side] = np.maximum(contact[:, side], on)
+    return contact
 
 
 def _smooth(x, win):
@@ -123,10 +188,11 @@ class InsoleIMUDataset(Dataset):
         left_pressure / right_pressure : [T, 112, 1]
         imu_data                       : [T, 5, 6]  順序: AL, AR, FL, FR, BC
         gt_joint_pos                   : [T, 18, 3]
-        gt_joint_rot                   : [T, 18, 6] (先頭4次元が W,X,Y,Z, 残り2次元は0)
-        gt_contact                     : [T, 2]     (未使用: 0 埋め)
+        gt_joint_rot                   : [T, 18, 6] (先頭4次元が関節の相対回転 W,X,Y,Z, 残り2次元は0)
+        gt_contact                     : [T, 2]     左足, 右足の接地 (1=接地, compute_foot_contact)
         body_params                    : [8]        (未使用: 0 埋め)
         data_id                        : 正規化に使った被験者キー (例: 'D1S1')
+        pos_mean / pos_std             : [18, 3]    位置の正規化統計量 (pos_mm = pos * pos_std + pos_mean)
 
     正規化統計量:
         学習時 (stats=None) は被験者キー (例: D1S1) ごとに、その被験者の
@@ -191,34 +257,33 @@ class InsoleIMUDataset(Dataset):
     def _parse_skeleton(self, csv_path):
         """
         スケルトンCSV (mocap の書き出し) を読み込む。
-        3行目のヘッダーから各関節の Position (X,Y,Z) と Angles (W,X,Y,Z) の列を探す。
+        3行目 (関節名) から各関節の Position と Angles の列を探し、
+        4行目 (軸ラベル) で Angles の成分の並びを判定する。
+
+        回転は親関節に対する相対回転 (関節角) で、W,X,Y,Z の順に並べ替えて返す
+        (CSV 上は X,Y,Z,W の順)。例外として次の関節は単位クオータニオンに変換する:
+          - CenterOfGravity : Angles 列が無いので単位クオータニオン [1,0,0,0]
+          - 肘 (HINGE_JOINTS) : CSV にはクオータニオンではなくヒンジ角が入っている
+                                (詳細は _hinge_to_quat)
+        符号は W >= 0 に揃える (q と -q は同じ回転のため)。
+
         戻り値: (time_sec [T], pos [T, J, 3], rot [T, J, 6])
+                rot の先頭4次元が W,X,Y,Z, 残り2次元は 0
         """
         with open(csv_path, 'r') as f:
             head = list(islice(f, 6))
         if len(head) < 6:
             return None
-        row2 = head[2].strip().split(',')
+        row2 = head[2].rstrip('\n').split(',')   # 関節名
+        row3 = head[3].rstrip('\n').split(',')   # 軸ラベル (X, Y, Z, W)
 
-        pos_cols, rot_cols = [], []
+        pos_cols = []
         for j in JOINT_NAMES:
-            # Position (X, Y, Z)
             if j in row2:
                 idx = row2.index(j)
                 pos_cols.extend([idx, idx + 1, idx + 2])
             else:
                 pos_cols.extend([0, 0, 0])
-
-            # Quaternion (W, X, Y, Z)
-            ang_name = j.replace("Positions", "Angles").replace("Position", "Angles")
-            if j == "CenterOfGravity":
-                # CenterOfGravity には Angles 列が無い (後で単位クオータニオンを入れる)
-                rot_cols.extend([-1, -1, -1, -1])
-            elif ang_name in row2:
-                idx = row2.index(ang_name)
-                rot_cols.extend([idx, idx + 1, idx + 2, idx + 3])
-            else:
-                rot_cols.extend([0, 0, 0, 0])
 
         df = pd.read_csv(csv_path, skiprows=5, header=None, low_memory=False)
         df = df.apply(pd.to_numeric, errors='coerce').fillna(0)
@@ -226,10 +291,34 @@ class InsoleIMUDataset(Dataset):
         time_sec = df[0].values * (1.0 / SKEL_FPS)
         pos_data = df[pos_cols].values.reshape(-1, self.J, 3)
 
-        safe_rot_cols = [c if c >= 0 else 0 for c in rot_cols]
-        rot_quat = df[safe_rot_cols].values.reshape(-1, self.J, 4)
-        # CenterOfGravity の回転は単位クオータニオン [1, 0, 0, 0] (W, X, Y, Z) に固定
-        rot_quat[:, JOINT_NAMES.index("CenterOfGravity"), :] = [1.0, 0.0, 0.0, 0.0]
+        # 既定は単位クオータニオン (W, X, Y, Z) = (1, 0, 0, 0)
+        rot_quat = np.zeros((len(df), self.J, 4))
+        rot_quat[..., 0] = 1.0
+        for ji, j in enumerate(JOINT_NAMES):
+            if j == "CenterOfGravity":
+                continue  # Angles 列が無い
+            ang_name = j.replace("Positions", "Angles").replace("Position", "Angles")
+            if ang_name not in row2:
+                print(f"  警告: {os.path.basename(csv_path)} に {ang_name} が無いため単位回転で埋めます")
+                continue
+            idx = row2.index(ang_name)
+            axis_col = {row3[idx + k].strip(): idx + k for k in range(4)}
+            if set(axis_col) != {'W', 'X', 'Y', 'Z'}:
+                raise ValueError(f"{csv_path}: {ang_name} の軸ラベルが想定外です ({list(axis_col)})")
+
+            if j in HINGE_JOINTS:
+                rot_quat[:, ji] = _hinge_to_quat(df[axis_col['Y']].values)
+            else:
+                rot_quat[:, ji] = df[[axis_col[a] for a in 'WXYZ']].values
+                norm = np.linalg.norm(rot_quat[:, ji], axis=1)
+                if np.max(np.abs(norm - 1.0)) > 1e-2:
+                    print(f"  警告: {ang_name} に単位クオータニオンでない値があります "
+                          f"(|q| = {norm.min():.3f}〜{norm.max():.3f})")
+
+        # q と -q は同じ回転を表す。CSV では途中で符号が反転するフレームがあり、
+        # 学習の正解値が不連続になるため W >= 0 の側に揃える
+        # (このデータでは |W| >= 0.18 で 180° 付近の回転が無いため、揃えても不連続は生じない)
+        rot_quat[rot_quat[..., 0] < 0] *= -1
 
         # モデルの回転出力 (6次元) に合わせ、4次元のクオータニオンを 0 でパディングする
         rot_6d = np.zeros((rot_quat.shape[0], self.J, 6))
@@ -351,6 +440,9 @@ class InsoleIMUDataset(Dataset):
             press_fl = aligned['FL'][1]                                  # [T, 112]
             press_fr = aligned['FR'][1]                                  # [T, 112]
 
+            # 接地ラベル (ルート相対化する前のグローバル座標で計算する)
+            contact = compute_foot_contact(pos)                          # [T, 2]
+
             # ルート (CenterOfGravity) 相対座標へ変換
             # 水平方向 (x, z) のみルート相対にし、鉛直方向 (y) は絶対値を保持する
             # （ジャンプ等の上下動を可視化で確認できるようにするため）
@@ -362,8 +454,10 @@ class InsoleIMUDataset(Dataset):
                   + (f", r={info['peak_r']:.2f}" if info.get('peak_r') is not None else '')
                   + f"), 使用フレーム {info['frames_kept']}")
 
+            print(f"  接地率: 左 {contact[:, 0].mean():.0%}, 右 {contact[:, 1].mean():.0%}")
+
             sessions.append(dict(data_id=data_id, key=subject_key(data_id), pos=pos, rot=rot,
-                                 imu=imu_combined, lp=press_fl, rp=press_fr))
+                                 imu=imu_combined, lp=press_fl, rp=press_fr, contact=contact))
 
         # ------------------------------------------------------------------
         # 被験者キーごとに統計量を計算 (stats が与えられていない場合)
@@ -397,7 +491,7 @@ class InsoleIMUDataset(Dataset):
                     'imu_data':       s['imu'][i:e],                   # [T, 5, 6]
                     'gt_joint_pos':   s['pos'][i:e],                   # [T, J, 3]
                     'gt_joint_rot':   s['rot'][i:e],                   # [T, J, 6]
-                    'gt_contact':     np.zeros((self.seq_len, 2)),      # placeholder
+                    'gt_contact':     s['contact'][i:e],               # [T, 2] 左, 右
                     'body_params':    np.zeros(self.BP),                # placeholder
                 })
                 count += 1
@@ -472,6 +566,9 @@ class InsoleIMUDataset(Dataset):
                 mean, std = norm[k]
                 v = (v - mean) / std
             out[k] = torch.tensor(v, dtype=torch.float32)
+        # 位置を mm に戻すための統計量 (骨長の損失・テスト時の逆正規化で使う)
+        out['pos_mean'] = torch.tensor(st['pos_mean'], dtype=torch.float32)  # [J, 3]
+        out['pos_std'] = torch.tensor(st['pos_std'], dtype=torch.float32)    # [J, 3]
         return out
 
 

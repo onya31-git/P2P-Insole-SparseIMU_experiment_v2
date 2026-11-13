@@ -5,7 +5,7 @@
 
 - 入力: 圧力 8×14 = 112 点 ×左右 + IMU (Gyro 3 + Acc 3) ×5 部位 (左右手首・左右足・背中)
 - 正解: mocap のスケルトン (100 Hz, 18 関節の位置 + クオータニオン)
-- 出力: 18 関節の位置 (CenterOfGravity 基準の相対座標) / 回転 / 接地 (未使用)
+- 出力: 18 関節の位置 (CenterOfGravity 基準の相対座標) / 回転 / 左右の足の接地
 
 ## 使い方
 
@@ -69,6 +69,7 @@ uv run visualize.py --end 3000   # 3D 可視化   → ブラウザで visualize.
     └── results/
         ├── predictions_pos.csv  関節位置 (Pred_* / GT_*)   test.py → evaluate.py, visualize.py
         ├── predictions_rot.csv  関節回転 (RotPred_* / RotGT_*) test.py → evaluate.py
+        ├── predictions_contact.csv 接地 (Pred_L/R 確率 / GT_L/R) test.py → evaluate.py
         ├── evaluation.txt       評価結果             evaluate.py
         └── visualize_data.js    可視化用データ       visualize.py → visualize.html
 ```
@@ -88,6 +89,9 @@ uv run visualize.py --end 3000   # 3D 可視化   → ブラウザで visualize.
    関節位置は水平方向 (x, z) のみ CenterOfGravity 基準にする (高さ y は絶対値のまま)。
    被験者 (`D1S1` など) ごとに統計量を計算して正規化し、`seq_len` (200 フレーム = 2 秒) ごとに分割。
    テスト時は学習時の統計量 (`stats.json`) をそのまま使う。
+   回転は W ≥ 0 に符号を揃える (q と −q は同じ回転で、CSV では途中で符号が反転するため)。
+   接地ラベルは mocap から作る: 左右それぞれ足首かつま先が「床から 15 mm 以内」かつ「400 mm/s 未満」なら接地
+   (`compute_foot_contact`)。閾値はインソール圧力の合計との一致度が最も高くなるよう決めた (一致率 91〜94%)。
 4. **モデル** (`models/system.py`)
 
    ```
@@ -99,12 +103,16 @@ uv run visualize.py --end 3000   # 3D 可視化   → ブラウザで visualize.
                                         KinematicFusion (Transformer) ← 上半身 + 下半身 ──────┘
                                                   └─ PoseDecoder → 関節位置 / 回転 / 接地
    ```
-5. **損失** `PoseLoss` (位置 L1・回転 L1・骨長・平滑化 など) + 0.1 × `CycleLoss` (潜在表現からセンサー入力を再構成)
-6. **評価** MPJPE (関節位置誤差, スケルトン CSV の単位) と、クオータニオンの L2 距離を部位別・関節別に出力。
+5. **損失** `PoseLoss` (位置 L1・回転 L1・骨長・接地 BCE・平滑化) + 0.1 × `CycleLoss` (潜在表現からセンサー入力を再構成)
+   骨長の損失は、位置を正規化統計量で実寸 [mm] に戻してから骨長の相対誤差 |L̂ − L| / L で計算する
+   (正規化は関節・軸ごとにスケールが違うため、正規化空間の距離は骨長として意味を持たない)。
+6. **評価** MPJPE (関節位置誤差 [mm])、回転誤差 (クオータニオンの L2 距離と角度差 [deg], いずれも q と −q を区別しない)、
+   骨長の誤差 [mm / %]、接地の正解率・F1 を出力。位置と回転は部位別・関節別にも出す。
 
 ## 補足
 
-- 回転はクオータニオン (W, X, Y, Z) の 4 次元を、モデル出力の 6 次元の先頭に入れ残りを 0 にしている。
-- `body_params` (体型) と `gt_contact` (接地) は現状ダミー (0 埋め) で、学習には実質使われていない。
-- `outputs/checkpoints/model.pth` などの現在のファイルは、旧環境 (`d:/20260218P2P-Insole+sparseIMU`) で
-  同じコード・同じデータで学習したもの (旧名 `best_model_quat_v2.pth`, `stats_quat_v2.json`) をコピーしたもの。
+- 回転は各関節の親に対する相対回転のクオータニオン (W, X, Y, Z) で、モデル出力の 6 次元の先頭 4 次元に入れ残りを 0 にしている。
+  スケルトン CSV は X, Y, Z, W 順で、肘だけヒンジ角が入っているため読み込み時に変換している (data/README.md 参照)。
+- `body_params` (体型) は現状ダミー (0 埋め) で、学習には実質使われていない。
+- 回転の読み込み修正 (列順・肘) 以前に旧環境 (`d:/20260218P2P-Insole+sparseIMU`) で学習した重みは
+  `checkpoints/best_model_quat_v2.pth` として旧環境に残っている (回転の定義が異なるため現在のコードとは互換性がない)。

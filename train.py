@@ -15,6 +15,7 @@ import argparse
 import torch
 
 from dataset import get_dataloader
+from dataset.dataset import KINEMATIC_TREE
 from losses.pose_loss import PoseLoss
 from losses.cycle_loss import CycleLoss
 from models import KinematicFusionSystem
@@ -27,15 +28,6 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return super().default(obj)
 
-
-# 骨長損失に使う関節の親子関係 (dataset.JOINT_NAMES のインデックス)
-KINEMATIC_TREE = [
-    (0, 1), (1, 2), (2, 3),
-    (2, 4), (4, 5), (5, 6),
-    (2, 7), (7, 8), (8, 9),
-    (0, 10), (10, 11), (11, 12), (12, 13),
-    (0, 14), (14, 15), (15, 16), (16, 17)
-]
 
 
 def train(config_path=DEFAULT_CONFIG):
@@ -88,12 +80,15 @@ def train(config_path=DEFAULT_CONFIG):
             gt_pos = batch['gt_joint_pos'].to(device)
             gt_rot = batch['gt_joint_rot'].to(device)
             gt_contact = batch['gt_contact'].to(device)
+            pos_mean = batch['pos_mean'].to(device)
+            pos_std = batch['pos_std'].to(device)
 
             optimizer.zero_grad()
             pred_pos, pred_rot, pred_contact, body_latent = model(lp, rp, imu, bp)
 
             loss_pose, _ = pose_loss_fn(pred_pos, gt_pos, pred_rot, gt_rot, pred_contact,
-                                        gt_contact, kinematic_tree=KINEMATIC_TREE)
+                                        gt_contact, kinematic_tree=KINEMATIC_TREE,
+                                        pos_mean=pos_mean, pos_std=pos_std)
             loss_cycle, _ = cycle_loss_fn(body_latent, lp, rp, imu)
             loss = loss_pose + cycle_w * loss_cycle
 
