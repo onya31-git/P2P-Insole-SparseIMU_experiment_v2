@@ -3,8 +3,8 @@
 入力の正規化・出力の逆正規化には学習時に保存した統計量 (stats.json) を使う。
 
 使い方:
-    python test.py [--config config.yaml]
-    python evaluate.py      # 続けて評価指標を計算
+    uv run test.py [--config config.yaml]
+    uv run evaluate.py      # 続けて評価指標を計算
 
 入力:
     outputs/checkpoints/model.pth, outputs/checkpoints/stats.json

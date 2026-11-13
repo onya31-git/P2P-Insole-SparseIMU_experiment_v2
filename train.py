@@ -2,7 +2,7 @@
 モデルを学習する。
 
 使い方:
-    python train.py [--config config.yaml]
+    uv run train.py [--config config.yaml]
 
 出力:
     outputs/checkpoints/model.pth   学習済み重み (エポックごとに上書き保存)
