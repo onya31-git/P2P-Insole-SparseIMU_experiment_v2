@@ -4,6 +4,8 @@
 ディレクトリ構成 (data_dir = config.yaml の paths.data_dir):
     {data_dir}/sensor/{train,test}/D1S1A1_AL.csv      ... センサーデータ
     {data_dir}/skeleton/{train,test}/D1S1A1_skeleton.csv ... スケルトン (クオータニオン形式)
+    {smpl_dir}/{train,test}/D1S1A1_smpl.npz            ... SMPL パラメータ (target='smpl' のとき。
+                                                           scripts/fit_smpl.py で BVH から作成)
 
 ファイル命名規則 (詳細は data/README.md):
     D: Data collection Number, S: Subject Number,
@@ -23,6 +25,12 @@
     「センサーの角速度ノルム」と「対応する関節の速度」の相互相関から
     オフセットを1つ推定し、センサー側をずらしてスケルトンに合わせる
     (estimate_sync_offset)。センサー範囲外となるフレームは切り捨てる。
+
+正解の形式 (target):
+    'skeleton' : mocap の 18 関節の位置 (正規化済み) と回転 (従来の方式)
+    'smpl'     : 上に加えて SMPL の姿勢 (6D 回転)・並進・関節位置。SMPL の npz は BVH と同じ
+                 フレーム (= スケルトン CSV の行) に対応するので、CSV と同じフレームを切り出す。
+    いずれの場合も body_params には被験者の β (config の smpl.subjects) を入れる (無ければ 0)。
 """
 import os
 import re
@@ -33,6 +41,9 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+from utils.rotation import axis_angle_to_matrix, matrix_to_rot6d
+from utils.smpl import NUM_BETAS
 
 
 SENSOR_RE = re.compile(r'^(D\d+S\d+[AT]\d+)_?(AL|AR|BC|FL|FR)_?\.csv$', re.IGNORECASE)
@@ -65,6 +76,14 @@ KINEMATIC_TREE = [
 HINGE_JOINTS = {"LElbowPositions", "RElbowPositions"}
 
 SKEL_FPS = 100.0
+
+# mocap の関節 (JOINT_NAMES のインデックス) -> 対応する SMPL 関節 (scripts/fit_smpl.py の CORR と同じ対応)。
+# CenterOfGravity と SpinePosition には対応する SMPL 関節が無い。
+MOCAP_TO_SMPL = {
+    2: 9, 3: 15,
+    4: 16, 5: 18, 6: 20, 7: 17, 8: 19, 9: 21,
+    10: 1, 11: 4, 12: 7, 13: 10, 14: 2, 15: 5, 16: 8, 17: 11,
+}
 
 # 接地ラベル (compute_foot_contact) の判定に使う関節と閾値
 FOOT_JOINTS = [("LAnklePositions", "LToePositions"), ("RAnklePositions", "RToePositions")]
@@ -190,9 +209,14 @@ class InsoleIMUDataset(Dataset):
         gt_joint_pos                   : [T, 18, 3]
         gt_joint_rot                   : [T, 18, 6] (先頭4次元が関節の相対回転 W,X,Y,Z, 残り2次元は0)
         gt_contact                     : [T, 2]     左足, 右足の接地 (1=接地, compute_foot_contact)
-        body_params                    : [8]        (未使用: 0 埋め)
+        body_params                    : [10]       被験者の体型 β (config の smpl.subjects。無ければ 0)
         data_id                        : 正規化に使った被験者キー (例: 'D1S1')
         pos_mean / pos_std             : [18, 3]    位置の正規化統計量 (pos_mm = pos * pos_std + pos_mean)
+      target='smpl' のとき追加:
+        gt_smpl_pose                   : [T, 24, 6] SMPL の局所回転 (6D)
+        gt_smpl_trans                  : [T, 3]     SMPL の並進 [m]。水平 (x, z) は 0 (ルート相対), y は絶対値
+        gt_smpl_joints                 : [T, 24, 3] SMPL の関節位置 [m] (水平方向は並進基準)
+        gender                         : 'male' / 'female' / 'neutral'
 
     正規化統計量:
         学習時 (stats=None) は被験者キー (例: D1S1) ごとに、その被験者の
@@ -202,7 +226,7 @@ class InsoleIMUDataset(Dataset):
     """
 
     def __init__(self, data_path, seq_len=64, mode='train', stats=None,
-                 exclude_calibration=True, sync_cfg=None):
+                 exclude_calibration=True, sync_cfg=None, target='skeleton', smpl_cfg=None):
         """
         Parameters
         ----------
@@ -221,7 +245,20 @@ class InsoleIMUDataset(Dataset):
               max_lag_sec  : float  探索範囲 ±秒 (既定 5.0)
               min_corr     : float  これ未満の相関なら警告 (既定 0.3)
               offsets      : {data_id: 秒}  手動指定 (自動推定より優先)
+        target : 'skeleton' or 'smpl'
+            正解の形式 (モジュールの docstring 参照)。
+        smpl_cfg : dict or None
+            config.yaml の smpl セクション (data_dir, subjects)。
         """
+        if target not in ('skeleton', 'smpl'):
+            raise ValueError(f"target は 'skeleton' か 'smpl' です: {target}")
+        self.target = target
+        smpl_cfg = smpl_cfg or {}
+        from utils.paths import resolve
+        self.smpl_dir = os.path.join(str(resolve(smpl_cfg.get('data_dir', 'data/smpl'))), mode)
+        self.subjects = {k.upper(): v for k, v in (smpl_cfg.get('subjects') or {}).items()}
+        # 被験者ごとの SMPL の情報 {subject_key: {gender, betas, offsets, offset_mask}} (評価で使う)
+        self.smpl_info = {}
         sync_cfg = sync_cfg or {}
         self.sync_enabled = sync_cfg.get('enabled', True)
         self.sync_max_lag = float(sync_cfg.get('max_lag_sec', 5.0))
@@ -235,7 +272,7 @@ class InsoleIMUDataset(Dataset):
         self.seq_len = seq_len
         self.exclude_calibration = exclude_calibration
 
-        self.BP = 8   # 体型パラメータ次元 (未使用)
+        self.BP = NUM_BETAS   # 体型パラメータ (SMPL の β) の次元
         self.J = len(JOINT_NAMES)
 
         self.id_stats = {}
@@ -398,6 +435,14 @@ class InsoleIMUDataset(Dataset):
                 print(f"  スケルトン読み込み失敗: {e}")
                 continue
 
+            key = subject_key(data_id)
+            betas = self._subject_betas(key)
+            smpl = None
+            if self.target == 'smpl':
+                smpl = self._load_smpl(data_id, key, betas, len(skel_t))
+                if smpl is None:
+                    continue
+
             raw = {}
             for part in ('AL', 'AR', 'BC'):
                 t, imu, _ = self._read_sensor_csv(parts[part], with_pressure=False)
@@ -423,6 +468,8 @@ class InsoleIMUDataset(Dataset):
                 print(f"  ID={data_id}: 同期後の有効フレームが {keep.sum()} しかないためスキップ")
                 continue
             skel_t, pos, rot, tq = skel_t[keep], pos[keep], rot[keep], tq[keep]
+            if smpl is not None:
+                smpl = {k: v[keep] for k, v in smpl.items()}
             info['frames_kept'] = f"{int(keep.sum())}/{len(keep)}"
             self.sync_info[data_id] = info
 
@@ -456,8 +503,9 @@ class InsoleIMUDataset(Dataset):
 
             print(f"  接地率: 左 {contact[:, 0].mean():.0%}, 右 {contact[:, 1].mean():.0%}")
 
-            sessions.append(dict(data_id=data_id, key=subject_key(data_id), pos=pos, rot=rot,
-                                 imu=imu_combined, lp=press_fl, rp=press_fr, contact=contact))
+            sessions.append(dict(data_id=data_id, key=key, pos=pos, rot=rot,
+                                 imu=imu_combined, lp=press_fl, rp=press_fr, contact=contact,
+                                 betas=betas, smpl=smpl))
 
         # ------------------------------------------------------------------
         # 被験者キーごとに統計量を計算 (stats が与えられていない場合)
@@ -484,7 +532,7 @@ class InsoleIMUDataset(Dataset):
             count = 0
             for i in range(0, n - self.seq_len, self.seq_len):
                 e = i + self.seq_len
-                all_seqs.append({
+                chunk = {
                     'data_id':        s['key'],                        # 正規化に使うキー
                     'left_pressure':  s['lp'][i:e, :, np.newaxis],     # [T, 112, 1]
                     'right_pressure': s['rp'][i:e, :, np.newaxis],     # [T, 112, 1]
@@ -492,11 +540,55 @@ class InsoleIMUDataset(Dataset):
                     'gt_joint_pos':   s['pos'][i:e],                   # [T, J, 3]
                     'gt_joint_rot':   s['rot'][i:e],                   # [T, J, 6]
                     'gt_contact':     s['contact'][i:e],               # [T, 2] 左, 右
-                    'body_params':    np.zeros(self.BP),                # placeholder
-                })
+                    'body_params':    s['betas'],                      # [10] 体型 β
+                }
+                if s['smpl'] is not None:
+                    chunk['gt_smpl_pose'] = s['smpl']['pose6d'][i:e]       # [T, 24, 6]
+                    chunk['gt_smpl_trans'] = s['smpl']['trans'][i:e]       # [T, 3]
+                    chunk['gt_smpl_joints'] = s['smpl']['joints'][i:e]     # [T, 24, 3]
+                    chunk['gender'] = self.smpl_info[s['key']]['gender']
+                all_seqs.append(chunk)
                 count += 1
             print(f"  ID={s['data_id']}: チャンク {count} 個 (累計 {len(all_seqs)})")
         return all_seqs
+
+    def _subject_betas(self, key):
+        """config の smpl.subjects から被験者の β [10] を返す (無ければ 0)。"""
+        if self.target == 'smpl' and key not in self.subjects:
+            raise ValueError(f"config.yaml の smpl.subjects に {key} がありません")
+        betas = np.zeros(self.BP)
+        b = list((self.subjects.get(key) or {}).get('betas') or [])[:self.BP]
+        betas[:len(b)] = b
+        return betas
+
+    def _load_smpl(self, data_id, key, betas, num_frames):
+        """SMPL の npz を読み、正解の形式に変換する (フレームはスケルトン CSV と同じ)。"""
+        path = os.path.join(self.smpl_dir, f'{data_id}_smpl.npz')
+        if not os.path.exists(path):
+            print(f"  ID={data_id}: {path} がないためスキップ (scripts/fit_smpl.py を実行してください)")
+            return None
+        z = np.load(path)
+        if len(z['poses']) != num_frames:
+            raise ValueError(f"{path}: フレーム数 {len(z['poses'])} がスケルトン CSV ({num_frames}) と異なります")
+        if np.max(np.abs(z['betas'] - betas)) > 1e-4:
+            raise ValueError(f"{path}: フィッティング時の β が config.yaml の {key} の β と異なります。"
+                             f"scripts/fit_smpl.py --overwrite で作り直してください")
+        gender = str(z['gender'])
+        cfg_gender = (self.subjects.get(key) or {}).get('gender', gender)
+        if cfg_gender != gender:
+            raise ValueError(f"{path}: フィッティング時の性別 ({gender}) が config.yaml ({cfg_gender}) と異なります。"
+                             f"scripts/fit_smpl.py --overwrite で作り直してください")
+        self.smpl_info[key] = dict(gender=gender, betas=betas, offsets=z['offsets'],
+                                   offset_mask=z['offset_mask'])
+
+        T = num_frames
+        aa = torch.as_tensor(z['poses'], dtype=torch.float32).reshape(T, -1, 3)
+        pose6d = matrix_to_rot6d(axis_angle_to_matrix(aa)).numpy()          # [T, 24, 6]
+        trans = z['trans'].astype(np.float64)
+        root_h = trans.copy()
+        root_h[:, 1] = 0.0                                                  # 水平方向 (x, z) だけ取り除く
+        return dict(pose6d=pose6d, trans=trans - root_h,
+                    joints=z['joints'] - root_h[:, None, :])
 
     def _resolve_sync_offset(self, data_id, skel_t, skel_pos, sens_t, sens_gyro):
         """手動指定 > 自動推定 > 0 の優先順でオフセット (秒) を決める。"""
@@ -559,7 +651,7 @@ class InsoleIMUDataset(Dataset):
         }
         out = {}
         for k, v in chunk.items():
-            if k == 'data_id':
+            if k in ('data_id', 'gender'):
                 out[k] = v  # 文字列はそのまま
                 continue
             if k in norm:
@@ -573,9 +665,9 @@ class InsoleIMUDataset(Dataset):
 
 
 def get_dataloader(data_path, batch_size=32, seq_len=64, mode='train',
-                   num_workers=0, stats=None, sync_cfg=None):
+                   num_workers=0, stats=None, sync_cfg=None, target='skeleton', smpl_cfg=None):
     dataset = InsoleIMUDataset(data_path, seq_len=seq_len, mode=mode, stats=stats,
-                               sync_cfg=sync_cfg)
+                               sync_cfg=sync_cfg, target=target, smpl_cfg=smpl_cfg)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -591,10 +683,11 @@ if __name__ == '__main__':
     cfg = load_config()
     loader = get_dataloader(str(get_paths(cfg).data_dir), batch_size=2,
                             seq_len=cfg['dataset'].get('seq_len', 200), mode='train',
-                            sync_cfg=cfg.get('sync'))
+                            sync_cfg=cfg.get('sync'), target=cfg['dataset'].get('target', 'skeleton'),
+                            smpl_cfg=cfg.get('smpl'))
     print(f"Dataset size: {len(loader.dataset)} sequences")
     print(f"Stats keys  : {list(loader.dataset.id_stats.keys())}")
     print(f"Sync        : { {k: round(v['offset_sec'], 2) for k, v in loader.dataset.sync_info.items()} }")
     batch = next(iter(loader))
-    for k in ('left_pressure', 'right_pressure', 'imu_data', 'gt_joint_pos', 'gt_joint_rot'):
-        print(f"{k:15s}: {tuple(batch[k].shape)}")
+    for k, v in batch.items():
+        print(f"{k:15s}: {tuple(v.shape) if hasattr(v, 'shape') else v}")

@@ -3,8 +3,12 @@
 
 使い方:
     uv run visualize.py [--start 0] [--end 3000] [--step 1] [--config config.yaml]
+    uv run visualize.py --mesh --start 0 --end 600 --step 3   # SMPL のメッシュも表示 (target: smpl)
 
-入力: outputs/results/predictions_pos.csv (test.py の出力)
+入力: outputs/results/predictions_pos.csv (test.py の出力, target: skeleton)
+      outputs/results/smpl_predictions.npz (test.py の出力, target: smpl。SMPL の 24 関節を表示)
+      --mesh を付けると SMPL のメッシュも重ねて表示する。メッシュは 1 フレームあたりのデータが大きい
+      (約 100 KB) ため、表示するフレーム数は --end / --step で数百フレーム程度に絞ること。
 出力: outputs/results/visualize_data.js  (visualize.html が読み込む)
       ローカル HTTP サーバーを立ててブラウザで visualize.html を開く。
 """
@@ -19,7 +23,41 @@ import threading
 import time
 import argparse
 
+import torch
+
 from utils.paths import ROOT, load_config, get_paths, DEFAULT_CONFIG
+from utils.smpl import SMPLBank, PARENTS
+
+MESH_FRAME_WARN = 600   # これを超えるフレーム数でメッシュを出力するときは警告する
+
+
+def load_smpl_predictions(paths):
+    """SMPL の予測と正解の関節位置 [N, 24, 3] (mm) と npz の中身を返す。"""
+    z = dict(np.load(paths.smpl_pred))
+    return z['pred_joints'] * 1000.0, z['gt_joints'] * 1000.0, z
+
+
+def smpl_meshes(config, z, frames, chunk=128):
+    """指定フレームの SMPL メッシュ (予測・正解) を mm 単位の整数で返す。"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    bank = SMPLBank(config, device)
+    out = {'pred': [], 'gt': []}
+    frames = np.asarray(frames)
+    genders = z['gender'][frames]
+    for s in range(0, len(frames), chunk):
+        i = frames[s:s + chunk]
+        g = str(genders[s])
+        if not np.all(genders[s:s + chunk] == g):
+            raise ValueError('1 回の表示範囲に性別の異なる被験者が混在しています')
+
+        def t(k):
+            return torch.as_tensor(z[k][i], device=device)
+        for key in ('pred', 'gt'):
+            v = bank(t(f'{key}_poses'), t('betas'), t(f'{key}_trans'), g, return_verts=True).verts
+            out[key] += np.round(v.cpu().numpy() * 1000).astype(int).reshape(len(i), -1).tolist()
+    faces = bank.faces(str(genders[0])).cpu().numpy()
+    out['faces'] = {'i': faces[:, 0].tolist(), 'j': faces[:, 1].tolist(), 'k': faces[:, 2].tolist()}
+    return out
 
 
 def visualize():
@@ -28,9 +66,14 @@ def visualize():
     parser.add_argument('--end', type=int, default=3000, help='End frame index (use -1 for all frames)')
     parser.add_argument('--step', type=int, default=1,
                         help='Visualize every N-th frame (e.g. 10 -> frames 0, 10, 20, ...)')
+    parser.add_argument('--mesh', action='store_true', help='SMPL のメッシュも表示する (target: smpl)')
     parser.add_argument('--config', default=DEFAULT_CONFIG)
     args = parser.parse_args()
-    paths = get_paths(load_config(args.config), makedirs=True)
+    config = load_config(args.config)
+    paths = get_paths(config, makedirs=True)
+    is_smpl = (config.get('dataset') or {}).get('target', 'skeleton') == 'smpl'
+    if args.mesh and not is_smpl:
+        parser.error('--mesh は dataset.target が smpl のときだけ使えます')
 
     start_idx = args.start
     end_idx = args.end
@@ -38,18 +81,21 @@ def visualize():
     if step < 1:
         parser.error('--step must be >= 1')
 
-    print(f"Loading {paths.pred_pos.name} (frames {start_idx} to {end_idx if end_idx != -1 else 'end'}, every {step} frame(s))...")
-    try:
-        df = pd.read_csv(paths.pred_pos)
-    except FileNotFoundError:
-        print(f"Error: {paths.pred_pos} not found. Run test.py first.")
+    src = paths.smpl_pred if is_smpl else paths.pred_pos
+    print(f"Loading {src.name} (frames {start_idx} to {end_idx if end_idx != -1 else 'end'}, every {step} frame(s))...")
+    if not src.exists():
+        print(f"Error: {src} not found. Run test.py first.")
         return
 
-    pred_cols = [c for c in df.columns if c.startswith('Pred_')]
-    gt_cols = [c for c in df.columns if c.startswith('GT_')]
-
-    flat_pred = df[pred_cols].values.reshape(-1, 18, 3)
-    flat_gt = df[gt_cols].values.reshape(-1, 18, 3)
+    smpl_npz = None
+    if is_smpl:
+        flat_pred, flat_gt, smpl_npz = load_smpl_predictions(paths)
+    else:
+        df = pd.read_csv(src)
+        pred_cols = [c for c in df.columns if c.startswith('Pred_')]
+        gt_cols = [c for c in df.columns if c.startswith('GT_')]
+        flat_pred = df[pred_cols].values.reshape(-1, 18, 3)
+        flat_gt = df[gt_cols].values.reshape(-1, 18, 3)
 
     total_frames = flat_pred.shape[0]
     if end_idx == -1 or end_idx > total_frames:
@@ -92,6 +138,15 @@ def visualize():
             'z': [min_vals[2], max_vals[2]]
         }
     }
+
+    if is_smpl:
+        output_data['kinematic_tree'] = [[p, j] for j, p in enumerate(PARENTS) if p >= 0]
+    if args.mesh:
+        if len(frame_indices) > MESH_FRAME_WARN:
+            print(f"警告: メッシュを {len(frame_indices)} フレーム分出力します。ファイルが大きくなり "
+                  f"ブラウザが重くなるため、--end / --step で {MESH_FRAME_WARN} フレーム以下に絞ることを推奨します")
+        print("Computing SMPL meshes...")
+        output_data['mesh'] = smpl_meshes(config, smpl_npz, frame_indices)
 
     # visualize.html が読み込む JS ファイルとして保存
     with open(paths.visualize_data, 'w') as f:

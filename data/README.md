@@ -6,13 +6,17 @@ data/
 │   └── 20261101DC_newInsole/
 │       ├── sensor/<デバイスID>/<録画>/<録画>.data.csv, .meta.json
 │       └── skeleton/{csv,bvh}/skeleton1〜4.*
+├── smpl/                        SMPL 形式のデータセット (scripts/fit_smpl.py が BVH から作成, git 管理外)
+│   ├── train/   D1S1A1〜A3_smpl.npz
+│   ├── test/    D1S1T1_smpl.npz
+│   └── fit_report.txt           フィッティング誤差のまとめ
 ├── sensor/                      学習用センサーデータ
 │   ├── train/   D1S1A1〜A3_{AL,AR,BC,FL,FR}.csv
 │   ├── test/    D1S1T1_{AL,AR,BC,FL,FR}.csv
 │   └── calib/   D1S1A0_{AL,AR,BC,FL,FR}.csv   (キャリブレーション。学習・テストでは使わない)
 └── skeleton/                    学習用スケルトン (mocap)
-    ├── train/   D1S1A1〜A3_skeleton.csv
-    └── test/    D1S1T1_skeleton.csv
+    ├── train/   D1S1A1〜A3_skeleton.{csv,bvh}
+    └── test/    D1S1T1_skeleton.{csv,bvh}
 ```
 
 `sensor/` と `skeleton/` は `python scripts/prepare_data.py` で `raw/` から再生成できます。
@@ -64,4 +68,11 @@ data/
     読み込み時に屈曲角 θ = π − なす角 から X 軸まわりの回転 (cos θ/2, sin θ/2, 0, 0) に変換している
     (`dataset/dataset.py` の `_hinge_to_quat`)。
   - `CenterOfGravity` には回転列が無いため、単位クオータニオンで埋めている。
+- **BVH**: 同じ mocap の書き出し (100 Hz, mm)。CSV と同じフレーム数で、階層は Hips をルートに
+  Spine〜Spine4・Neck・Head・腕・脚・つま先 (+ End Site)。回転は CHANNELS の記載順 (X, Y, Z) の内因性オイラー角 [deg]。
+  順運動学の結果は CSV の関節位置と 0.03 mm 以内で一致する (`scripts/check_bvh.py`)。
+  レストポーズは T ポーズで、y が上・+z が正面・+x が左 (SMPL と同じ向き)。
+- **SMPL npz** (`data/smpl/`): AMASS と同じキー `poses` [T, 72] (軸角), `trans` [T, 3] (m), `betas`, `gender`,
+  `mocap_framerate` に加え、`joints` [T, 24, 3], `offsets` (SMPL 関節 → mocap 関節の定義の差),
+  `fit_err_mm`, `ori_err_deg` を含む。フレームは BVH / CSV と同じ (データセット読み込み時に CSV と同じ範囲を切り出す)。
   生データはセミコロン区切りのため、`prepare_data.py` でカンマ区切りに変換している。

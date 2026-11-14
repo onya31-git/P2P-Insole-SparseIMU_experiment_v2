@@ -14,6 +14,8 @@
         ├── predictions_pos.csv 関節位置の予測と正解      (test.py)
         ├── predictions_rot.csv 関節回転の予測と正解      (test.py)
         ├── predictions_contact.csv 接地の予測と正解      (test.py)
+        ├── smpl_predictions.npz SMPL の予測と正解        (test.py, dataset.target = smpl のとき)
+        ├── mesh/               メッシュ (OBJ)            (scripts/export_mesh.py)
         ├── evaluation.txt      評価指標 (MPJPE 等)       (evaluate.py)
         └── visualize_data.js   可視化用データ            (visualize.py)
 
@@ -61,6 +63,8 @@ def get_paths(config, makedirs=False):
         pred_pos=results / 'predictions_pos.csv',
         pred_rot=results / 'predictions_rot.csv',
         pred_contact=results / 'predictions_contact.csv',
+        smpl_pred=results / 'smpl_predictions.npz',
+        mesh_dir=results / 'mesh',
         evaluation=results / 'evaluation.txt',
         visualize_data=results / 'visualize_data.js',
     )

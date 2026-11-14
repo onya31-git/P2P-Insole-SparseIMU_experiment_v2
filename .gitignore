@@ -87,6 +87,15 @@ build/
 
 data/raw/**/*.json
 
+# SMPL のモデルファイル (ライセンス上再配布不可) と、そこから作る生成物
+body_models/
+data/smpl/
+*.npz
+*.obj
+
+# prepare_data.py が raw からコピーする BVH (元データは data/raw/ にある)
+data/skeleton/**/*.bvh
+
 # 学習・推論の生成物
 outputs/
 

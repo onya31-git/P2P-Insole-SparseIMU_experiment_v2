@@ -4,6 +4,11 @@
 使い方:
     uv run train.py [--config config.yaml]
 
+config.yaml の dataset.target で正解の形式を切り替える:
+    skeleton : mocap の 18 関節の位置・回転を直接推定 (PoseLoss)
+    smpl     : SMPL のパラメータ (並進 + 局所回転) を推定し、SMPL の順運動学で関節位置を求めて
+               損失を計算する (SMPLPoseLoss)。正解は data/smpl/ (scripts/fit_smpl.py で作成)
+
 出力:
     outputs/checkpoints/model.pth   学習済み重み (エポックごとに上書き保存)
     outputs/checkpoints/stats.json  正規化統計量 (test.py で使用)
@@ -18,8 +23,10 @@ from dataset import get_dataloader
 from dataset.dataset import KINEMATIC_TREE
 from losses.pose_loss import PoseLoss
 from losses.cycle_loss import CycleLoss
+from losses.smpl_loss import SMPLPoseLoss
 from models import KinematicFusionSystem
 from utils.paths import load_config, get_paths, DEFAULT_CONFIG
+from utils.smpl import SMPLBank
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -39,8 +46,13 @@ def train(config_path=DEFAULT_CONFIG):
     cy_cfg = config.get('cycle_loss', {})
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    target = ds_cfg.get('target', 'skeleton')
+    print(f"[train] 正解の形式: {target}")
     model = KinematicFusionSystem(config=config).to(device)
-    pose_loss_fn = PoseLoss(lambdas=config.get('losses')).to(device)
+    if target == 'smpl':
+        pose_loss_fn = SMPLPoseLoss(SMPLBank(config, device), lambdas=config.get('smpl_losses'))
+    else:
+        pose_loss_fn = PoseLoss(lambdas=config.get('losses')).to(device)
     cycle_loss_fn = CycleLoss(
         pressure_nodes=cy_cfg.get('pressure_nodes', 112),
         imu_channels=cy_cfg.get('imu_channels', 6),
@@ -57,6 +69,8 @@ def train(config_path=DEFAULT_CONFIG):
         mode='train',
         num_workers=ds_cfg.get('num_workers', 0),
         sync_cfg=config.get('sync'),
+        target=target,
+        smpl_cfg=config.get('smpl'),
     )
 
     with open(paths.sync_train, 'w', encoding='utf-8') as f:
@@ -86,9 +100,14 @@ def train(config_path=DEFAULT_CONFIG):
             optimizer.zero_grad()
             pred_pos, pred_rot, pred_contact, body_latent = model(lp, rp, imu, bp)
 
-            loss_pose, _ = pose_loss_fn(pred_pos, gt_pos, pred_rot, gt_rot, pred_contact,
-                                        gt_contact, kinematic_tree=KINEMATIC_TREE,
-                                        pos_mean=pos_mean, pos_std=pos_std)
+            if target == 'smpl':
+                # pred_pos = SMPL の並進, pred_rot = 局所回転 (6D)
+                sb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+                loss_pose, info, _ = pose_loss_fn(pred_pos, pred_rot, pred_contact, sb)
+            else:
+                loss_pose, info = pose_loss_fn(pred_pos, gt_pos, pred_rot, gt_rot, pred_contact,
+                                               gt_contact, kinematic_tree=KINEMATIC_TREE,
+                                               pos_mean=pos_mean, pos_std=pos_std)
             loss_cycle, _ = cycle_loss_fn(body_latent, lp, rp, imu)
             loss = loss_pose + cycle_w * loss_cycle
 
@@ -96,7 +115,9 @@ def train(config_path=DEFAULT_CONFIG):
             optimizer.step()
 
             if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{batch_idx}], Loss: {loss.item():.4f}")
+                extra = (f", MPJPE {info['mpjpe_mm']:.1f} mm, Rot {info['rot_deg']:.1f} deg"
+                         if 'mpjpe_mm' in info else '')
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{batch_idx}], Loss: {loss.item():.4f}{extra}")
 
         torch.save(model.state_dict(), paths.weights)
         print(f"Epoch [{epoch+1}/{num_epochs}] 終了: 重みを '{paths.weights}' に保存しました。")

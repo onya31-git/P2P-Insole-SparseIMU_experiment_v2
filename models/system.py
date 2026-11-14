@@ -2,7 +2,8 @@
 モデル全体 (KinematicFusionSystem)。
 
 入力  : 左右インソール圧力 + 5 部位の IMU (+ 体型パラメータ)
-出力  : 18 関節の位置 / 回転 / 接地確率, および中間表現 body_latent
+出力  : (dataset.target = 'skeleton') 18 関節の位置 / 回転 / 接地 (logits), body_latent
+        (dataset.target = 'smpl')     SMPL の並進 / 24 関節の局所回転 (6D) / 接地 (logits), body_latent
 
     PressureEncoder ─┐
                      ├─ FootFusion ─ LowerBodyNet ─┐
@@ -19,7 +20,7 @@ from models.foot_fusion import FootFusion
 from models.lower_body_net import LowerBodyNet
 from models.upper_body_net import UpperBodyNet
 from models.kinematic_fusion import KinematicFusion
-from models.pose_decoder import PoseDecoder
+from models.pose_decoder import PoseDecoder, SMPLPoseDecoder
 
 
 class KinematicFusionSystem(nn.Module):
@@ -34,7 +35,12 @@ class KinematicFusionSystem(nn.Module):
         self.lower_body_net = LowerBodyNet(**mdl.get('lower_body_net', {}))
         self.upper_body_net = UpperBodyNet(**mdl.get('upper_body_net', {}))
         self.kinematic_fusion = KinematicFusion(**mdl.get('kinematic_fusion', {}))
-        self.pose_decoder = PoseDecoder(**mdl.get('pose_decoder', {}))
+        # 正解の形式に合わせてデコーダーを切り替える (属性名はどちらも pose_decoder)
+        self.target = ((config or {}).get('dataset') or {}).get('target', 'skeleton')
+        if self.target == 'smpl':
+            self.pose_decoder = SMPLPoseDecoder(**mdl.get('smpl_pose_decoder', {}))
+        else:
+            self.pose_decoder = PoseDecoder(**mdl.get('pose_decoder', {}))
 
     def forward(self, left_pressure, right_pressure, imu_data, body_params):
         # 1. Encoders
@@ -54,6 +60,7 @@ class KinematicFusionSystem(nn.Module):
         body_latent = self.kinematic_fusion(upper_latent, lower_latent)
 
         # 6. Pose Decoder
+        #   skeleton: (関節位置, 回転, 接地) / smpl: (並進, 局所回転 6D, 接地)
         pos, rot, contact = self.pose_decoder(body_latent)
 
         return pos, rot, contact, body_latent

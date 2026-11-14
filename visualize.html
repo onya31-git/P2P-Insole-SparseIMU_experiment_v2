@@ -89,15 +89,18 @@
             return {x, y, z};
         }
 
-                function extractBones(joints) {
-            const kinematic_tree = [
-                [0, 1], [1, 2], [2, 3],           // Spine to Head
-                [2, 4], [4, 5], [5, 6],           // Left Arm
-                [2, 7], [7, 8], [8, 9],           // Right Arm
-                [0, 10], [10, 11], [11, 12], [12, 13], // Left Leg
-                [0, 14], [14, 15], [15, 16], [16, 17]  // Right Leg
-            ];
-            
+        // mocap の 18 関節の骨。SMPL のときは visualize.py が kinematic_tree を渡す
+        const DEFAULT_TREE = [
+            [0, 1], [1, 2], [2, 3],           // Spine to Head
+            [2, 4], [4, 5], [5, 6],           // Left Arm
+            [2, 7], [7, 8], [8, 9],           // Right Arm
+            [0, 10], [10, 11], [11, 12], [12, 13], // Left Leg
+            [0, 14], [14, 15], [15, 16], [16, 17]  // Right Leg
+        ];
+
+        function extractBones(joints) {
+            const kinematic_tree = skeletonData.kinematic_tree || DEFAULT_TREE;
+
             let bx = [], by = [], bz = [];
             for (let i = 0; i < kinematic_tree.length; i++) {
                 const parent = kinematic_tree[i][0];
@@ -215,7 +218,31 @@
                 }
             ];
 
+            // SMPL のメッシュ (visualize.py --mesh のとき)。凡例をクリックすると表示を切り替えられる
+            if (skeletonData.mesh) {
+                const m = skeletonData.mesh;
+                [['pred', 'Predicted (Mesh)', '#03dac6'], ['gt', 'Ground Truth (Mesh)', '#cf6679']].forEach(([k, name, color]) => {
+                    const v = meshCoords(m[k][0]);
+                    traces.push({
+                        type: 'mesh3d', name: name, showlegend: true,
+                        x: v.x, y: v.y, z: v.z, i: m.faces.i, j: m.faces.j, k: m.faces.k,
+                        color: color, opacity: 0.35, flatshading: false, hoverinfo: 'skip',
+                        lighting: { ambient: 0.6, diffuse: 0.8, specular: 0.2 }
+                    });
+                });
+            }
+
             Plotly.newPlot('plot', traces, layout, {responsive: true});
+        }
+
+        // 頂点 [x0, y0, z0, x1, ...] (1 次元) -> {x, y, z}
+        function meshCoords(flat) {
+            const n = flat.length / 3;
+            const x = new Array(n), y = new Array(n), z = new Array(n);
+            for (let i = 0; i < n; i++) {
+                x[i] = flat[3 * i]; y[i] = flat[3 * i + 1]; z[i] = flat[3 * i + 2];
+            }
+            return {x, y, z};
         }
 
         function updatePlot(frameIdx) {
@@ -228,7 +255,15 @@
             const gtBones = extractBones(gtPos);
             
             let plotDiv = document.getElementById('plot');
-            if (plotDiv.data && plotDiv.data.length === 4) {
+            if (skeletonData.mesh && plotDiv.data && plotDiv.data.length === 6) {
+                ['pred', 'gt'].forEach((k, n) => {
+                    const v = meshCoords(skeletonData.mesh[k][frameIdx]);
+                    plotDiv.data[4 + n].x = v.x;
+                    plotDiv.data[4 + n].y = v.y;
+                    plotDiv.data[4 + n].z = v.z;
+                });
+            }
+            if (plotDiv.data && plotDiv.data.length >= 4) {
                 plotDiv.data[0].x = predCoords.x;
                 plotDiv.data[0].y = predCoords.y;
                 plotDiv.data[0].z = predCoords.z;

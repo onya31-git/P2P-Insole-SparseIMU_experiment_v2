@@ -2,11 +2,43 @@
 #   出力ファイルの内訳は README.md / utils/paths.py を参照
 paths:
   data_dir: "data"        # sensor/ と skeleton/ を含むフォルダ
-  output_dir: "outputs"   # 学習済み重み・同期結果・予測・評価の保存先
+  output_dir: "outputs/smpl"   # 学習済み重み・同期結果・予測・評価の保存先
+                               # (target: skeleton の従来の結果は outputs/ に残してある)
 
 dataset:
   seq_len: 200
   num_workers: 0
+  # 学習の正解の形式
+  #   skeleton : mocap の 18 関節の位置 + 回転 (従来の方式)
+  #   smpl     : SMPL のパラメータ (data/smpl/ の npz。scripts/fit_smpl.py で作成)
+  target: smpl
+
+# SMPL 人体モデル
+smpl:
+  model_dir: "body_models"   # SMPL 公式の pkl を置くフォルダ (git 管理外)
+  data_dir: "data/smpl"      # fit_smpl.py の出力先 ({train,test}/<ID>_smpl.npz)
+  # 被験者ごとの性別と体型パラメータ β (10 次元。足りない分は 0 埋め)
+  #   キーは収録 ID の先頭 D?S? (例 D1S1)。β はフィッティングでは固定値として使い、
+  #   学習ではモデルへの入力 (body_params) にもなる。
+  subjects:
+    D1S1:
+      gender: male           # ※ 仮の値。被験者に合わせて male / female / neutral を設定する
+      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # ※ 仮の値 (平均体型)。収集した β に置き換える
+
+# SMPL フィッティング (scripts/fit_smpl.py)
+fit_smpl:
+  device: cuda
+  offset_stride: 10      # 段階 1 (関節定義の差 = オフセットの推定) で使うフレーム間隔
+  offset_iters: 800
+  pose_iters: 600        # 段階 2 (全フレームの姿勢推定) の反復回数
+  lr: 0.01
+  weights:
+    pos: 1.0             # 関節位置 [cm^2]
+    ori: 5.0             # BVH のグローバル回転との差 (ねじれを決める)
+    offset: 0.05         # オフセットの大きさ [cm^2]
+    hinge: 10.0          # 膝・肘の外転方向の回転を抑える
+    prior: 1.0           # 位置の対応が無い関節 (脊椎・つま先) を初期値の近くに保つ
+    smooth: 0.0          # 関節の加速度 [cm/frame^2]^2 (収束を大きく遅らせるため既定は無効)
 
 # センサーと mocap の時刻同期 (収録ごとにオフセットを自動推定)
 #   センサー時刻 = スケルトン時刻 + offset_sec
@@ -36,7 +68,7 @@ model:
     embed_dim: 128
   lower_body_net:
     feature_dim: 128
-    body_param_dim: 8
+    body_param_dim: 10   # SMPL の β の次元
     hidden_dim: 256
     num_layers: 2
     nhead: 8
@@ -44,23 +76,38 @@ model:
   upper_body_net:
     feature_dim: 128
     lower_latent_dim: 256
-    body_param_dim: 8
+    body_param_dim: 10
     hidden_dim: 256
     num_layers: 2
   kinematic_fusion:
     upper_dim: 256
     lower_dim: 256
-  pose_decoder:
+  pose_decoder:          # target: skeleton のとき
     in_features: 512
     num_joints: 18
+  smpl_pose_decoder:     # target: smpl のとき
+    in_features: 512
+    hidden: 256
+    init_trans_y: 1.1    # 並進 y の初期値 [m] (SMPL の骨盤の高さ ≒ 並進 y - 0.24)
 
 cycle_loss:
   pressure_nodes: 112
   imu_channels: 6
 
+# 損失の重み (target: skeleton)
 losses:
   pos: 1.0
   rot: 1.0
   bone: 0.5
   contact: 0.1
   smooth: 0.01
+
+# 損失の重み (target: smpl)。位置は m, 速度は m/s 単位
+smpl_losses:
+  rot: 1.0          # 局所回転 (回転行列の L1, 手を除く 22 関節)
+  glob_rot: 1.0     # グローバル回転 (順運動学後の回転行列の L1)
+  joint: 5.0        # 関節位置 (SMPL の順運動学, 平均ユークリッド距離 [m])
+  trans: 1.0        # 並進 [m]
+  contact: 0.1      # 接地 (BCE)
+  smooth: 0.1       # 関節速度の差 [m/s]
+  foot_skate: 0.1   # 正解で接地しているフレームの足 (足首・つま先) の速度の誤差 [m/s]

@@ -6,6 +6,8 @@
                  data/sensor/<split>/<ID>_<部位>.csv にリネームする
     - スケルトン: data/raw/<収録>/skeleton/csv/<名前>.csv の区切り文字 ';' を ',' に、
                  改行を LF に変換して data/skeleton/<split>/<ID>_skeleton.csv に保存する
+    - BVH       : data/raw/<収録>/skeleton/bvh/<名前>.bvh をそのままコピーし、
+                 data/skeleton/<split>/<ID>_skeleton.bvh に保存する (SMPL フィッティングの入力)
 
 新しい収録を追加するときは COLLECTIONS に対応表を追記する。
 
@@ -64,6 +66,9 @@ def main():
                 src = base / 'skeleton' / 'csv' / f'{skel}.csv'
                 dst = args.out_dir / 'skeleton' / split / f'{data_id}_skeleton.csv'
                 tasks.append((convert_skeleton, src, dst))
+                src = base / 'skeleton' / 'bvh' / f'{skel}.bvh'
+                dst = args.out_dir / 'skeleton' / split / f'{data_id}_skeleton.bvh'
+                tasks.append((shutil.copyfile, src, dst))
 
     missing = [str(src) for _, src, _ in tasks if not src.exists()]
     if missing:

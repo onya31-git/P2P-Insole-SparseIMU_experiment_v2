@@ -63,6 +63,57 @@ class PoseDecoder(nn.Module):
         
         return positions, rotations_6d, contact_logits
 
+class SMPLPoseDecoder(nn.Module):
+    """
+    body_latent から SMPL のパラメータを推定する (dataset.target = 'smpl' のとき使う)。
+
+    出力:
+        trans    [B, T, 3]      SMPL の並進 [m] (学習データでは水平 x, z = 0, y は絶対値)
+        pose_6d  [B, T, 24, 6]  各関節の局所回転 (6D 表現)。手 (22, 23) は観測できないため
+                                常に単位回転とし、22 関節だけを推定する
+        contact  [B, T, 2]      左右の足の接地 (logits)
+
+    関節位置・メッシュは学習モデルの外で SMPL (utils/smpl.py) に通して求める
+    (SMPL のデータを state_dict に含めないため)。
+    """
+    NUM_PRED_JOINTS = 22
+
+    def __init__(self, in_features=512, hidden=256, init_trans_y=0.0):
+        super().__init__()
+        J = self.NUM_PRED_JOINTS
+        self.rotation_decoder = nn.Sequential(
+            nn.Linear(in_features, hidden), nn.ReLU(), nn.Linear(hidden, J * 6))
+        # 並進: MLP + 線形のスキップ経路。MLP だけだと、しゃがみ・座りなど頻度の低い低い姿勢で
+        # ReLU がすべて不活性になり出力が定数 (≒ 平均の腰の高さ) に張り付くことがあったため
+        self.trans_decoder = nn.Sequential(
+            nn.Linear(in_features, hidden), nn.ReLU(), nn.Linear(hidden, 3))
+        self.trans_skip = nn.Linear(in_features, 3)
+        self.contact_decoder = nn.Sequential(
+            nn.Linear(in_features, 64), nn.ReLU(), nn.Linear(64, 2))
+
+        identity_6d = torch.tensor([1.0, 0, 0, 0, 1.0, 0])
+        with torch.no_grad():
+            # 学習開始時の出力を「単位回転」「平均的な腰の高さ」付近にする
+            last = self.rotation_decoder[-1]
+            last.weight.mul_(0.1)
+            last.bias.copy_(identity_6d.repeat(J))
+            self.trans_decoder[-1].bias.copy_(torch.tensor([0.0, init_trans_y, 0.0]))
+            # スキップ経路は 0 から始める (ランダム初期化だと学習初期の並進が大きく乱れ、
+            # 関節位置の損失に引っ張られて膝が骨軸まわりに 180° ねじれた局所解に落ちることがあった)
+            self.trans_skip.weight.zero_()
+            self.trans_skip.bias.zero_()
+        self.register_buffer('hand_6d', identity_6d.repeat(2, 1), persistent=False)
+
+    def forward(self, body_latent):
+        B, T, _ = body_latent.shape
+        pose_6d = self.rotation_decoder(body_latent).view(B, T, self.NUM_PRED_JOINTS, 6)
+        hands = self.hand_6d.expand(B, T, 2, 6)
+        pose_6d = torch.cat([pose_6d, hands], dim=2)                     # [B, T, 24, 6]
+        trans = self.trans_decoder(body_latent) + self.trans_skip(body_latent)
+        contact = self.contact_decoder(body_latent)
+        return trans, pose_6d, contact
+
+
 if __name__ == '__main__':
     B, T, F = 2, 10, 512
     model = PoseDecoder(in_features=F, num_joints=17)
