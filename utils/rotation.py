@@ -140,3 +140,25 @@ def minimal_rotation(a, b):
         axis = F.normalize(torch.cross(a, tmp, dim=-1), dim=-1)
         return axis_angle_to_matrix(axis * torch.pi)
     return axis_angle_to_matrix(v / s * torch.atan2(s, c))
+
+
+def twist_sin_half(R, axis):
+    """
+    回転 R を swing-twist 分解 (R = swing @ twist, twist は axis まわり, swing の軸は axis に直交) したときの
+    ねじれ角 t の sin(t / 2) (符号付き, |t| < π)。R [..., 3, 3], axis [..., 3] (単位ベクトル) -> [...]
+
+    クオータニオン (w, v) を使うと t = 2 atan2(v·axis, w)。ここでは 1 + tr(R) = 4w², vee(R - Rᵀ) = 4w v から
+    sin(t/2) = (vee·axis) / sqrt((1 + tr)² + (vee·axis)²) を直接計算する。分岐や atan2 が無く、
+    最適化の損失に使っても勾配が安定する (分母が 0 になるのは swing が 180° のときだけ)。
+    """
+    vee = torch.stack([R[..., 2, 1] - R[..., 1, 2], R[..., 0, 2] - R[..., 2, 0], R[..., 1, 0] - R[..., 0, 1]], -1)
+    p = (vee * axis).sum(-1)
+    c = 1.0 + R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    return p / torch.sqrt(c * c + p * p + 1e-12)
+
+
+def remove_twist(R, axis):
+    """R から axis まわりのねじれを取り除いた swing 成分 [..., 3, 3] (R = swing @ twist)。"""
+    s = twist_sin_half(R, axis).clamp(-1.0, 1.0)
+    t = 2 * torch.asin(s)
+    return R @ axis_angle_to_matrix(-t[..., None] * axis)

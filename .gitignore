@@ -82,6 +82,7 @@ build/
 *.npy
 *.pkl
 *.html
+!mesh_viewer.html
 *.js
 !visualize.html
 

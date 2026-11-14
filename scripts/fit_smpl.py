@@ -6,7 +6,7 @@ mocap の BVH を SMPL のパラメータにフィッティングし、SMPL 形�
     config.yaml の smpl.subjects.<D?S?>            (被験者ごとの性別と体型 β。β は固定値として使う)
 出力:
     data/smpl/{train,test}/<ID>_smpl.npz            (AMASS 互換のキー + 確認用の値)
-        poses           [T, 72]   SMPL の姿勢 (軸角, 局所回転)。手 (22, 23) は単位回転
+        poses           [T, 72]   SMPL の姿勢 (軸角, 局所回転)。手 (22, 23) は固定値 (指を軽く曲げた形)
         trans           [T, 3]    並進 [m] (mocap のワールド座標, y が鉛直)
         betas           [10]      体型 (config の値そのまま)
         gender                    'male' / 'female' / 'neutral'
@@ -26,7 +26,17 @@ mocap の BVH を SMPL のパラメータにフィッティングし、SMPL 形�
        (オフセット: SMPL 関節から見た mocap 関節の位置, 被験者ごとに一定) を同時に推定する
     2. 段階 2: オフセットを固定し、収録ごとに全フレームの姿勢・並進を推定する
     損失: 関節位置, BVH のグローバル回転 (骨軸まわりのねじれを決める), 膝・肘のヒンジ性,
-          位置の対応が無い関節を初期値の近くに保つ項, 関節の加速度 (段階 2 のみ, 既定は無効)
+          位置の対応が無い関節を初期値の近くに保つ項, 関節の加速度 (段階 2 のみ, 既定は無効),
+          前腕のねじれ (下記), 手首の局所回転
+    ※ 前腕・手 (肘・手首) の向きの扱い:
+      BVH の前腕の骨軸まわりのねじれ (回内・回外) は信頼できない (人体の可動域を超える値や、
+      左右で 60〜90° 中心がずれた値になっている。手首のねじれのチャンネルは常に 0)。
+      そのため既定では、肘・手首の BVH のグローバル回転は使わず (weights.arm_ori = 0)、
+        - 肘の局所回転のねじれ: 0 (T ポーズで手のひらが下 = 前腕の中間位) に寄せ (weights.twist)、
+          可動域 (TWIST_LIMIT_DEG) を超えたら強く罰する (weights.twist_limit)
+        - 手首の局所回転: BVH の手首の局所回転 (前腕に対する屈曲・橈尺屈) に合わせる (weights.wrist)
+      とする。肘の曲げ・前腕の向きは関節位置で決まる。手のひらの向きは実測ではなく
+      「もっともらしい推定」になる点に注意 (手首の IMU を使えば実測にできる可能性がある)。
     ※ 加速度の項はフレーム間を結合するため収束が大きく遅れる。mocap (100 Hz) 自体が滑らかで、
       無しでもジッターは mocap と同程度 (レポートの「ジッター比」) なので既定の重みは 0。
     β はフィッティングでは変えない (config の値をそのまま使う)。
@@ -50,8 +60,9 @@ from dataset.dataset import subject_key                                   # noqa
 from utils.bvh import load_bvh                                            # noqa: E402
 from utils.paths import load_config, get_paths, resolve, DEFAULT_CONFIG   # noqa: E402
 from utils.rotation import (rot6d_to_matrix, matrix_to_rot6d, matrix_to_axis_angle,  # noqa: E402
-                            geodesic_angle, minimal_rotation)
-from utils.smpl import SMPL, NUM_JOINTS, PARENTS, JOINT_NAMES, NUM_BETAS  # noqa: E402
+                            geodesic_angle, minimal_rotation, twist_sin_half, remove_twist)
+from utils.smpl import (SMPL, NUM_JOINTS, PARENTS, JOINT_NAMES, NUM_BETAS,  # noqa: E402
+                        HAND_JOINTS, relaxed_hand_rotmat)
 
 # ----------------------------------------------------------------------
 # SMPL 関節と BVH 関節の対応
@@ -83,11 +94,20 @@ CORR = {
     19: ('RightForeArm',   1.0, 1.0, (21, 'RightHand')),
     20: ('LeftHand',       1.0, 1.0, (22, 'LeftHand_End')),
     21: ('RightHand',      1.0, 1.0, (23, 'RightHand_End')),
-    22: ('LeftHand_End',   0.3, 0.0, 'same:20'),
-    23: ('RightHand_End',  0.3, 0.0, 'same:21'),
+    # Hand_End は BVH の End Site で、位置は BVH の (信頼できない) 前腕のねじれから計算されたもの。
+    # 位置を合わせるとねじれが BVH に引き戻されるため使わない (位置の重み 0)
+    22: ('LeftHand_End',   0.0, 0.0, 'same:20'),
+    23: ('RightHand_End',  0.0, 0.0, 'same:21'),
 }
 HINGE = [4, 5, 18, 19]                    # 膝・肘: 局所 z 軸まわり (外転方向) の回転を抑える
 PRIOR = [3, 6, 9, 10, 11, 12, 15, 22, 23]  # 位置だけでは決まりにくい関節 (初期値の近くに保つ)
+ARM_ORI = [18, 19, 20, 21]                 # BVH のグローバル回転の重みを weights.arm_ori 倍する関節 (肘・手首)
+WRIST = [20, 21]                           # 局所回転を BVH の局所回転に合わせる関節
+# 肘の局所回転のねじれ (前腕の骨軸まわり, 回内・回外)。SMPL のレストポーズ (T ポーズで手のひらが下,
+# 親指が前) が前腕の中間位にあたる。(SMPL 関節, 骨の先の関節, 回内の符号)
+#   左腕の骨軸は +x 向きで正のねじれが回内、右腕は -x 向きで正のねじれが回外
+ELBOW_TWIST = [(18, 20, 1.0), (19, 21, -1.0)]
+TWIST_LIMIT_DEG = (-85.0, 80.0)            # (回外, 回内) の可動域 [deg]。これを超えたら weights.twist_limit で罰する
 PARENT_FRAME = [0 if p < 0 else p for p in PARENTS]   # オフセットは親関節の座標系で持つ
 
 # 骨長の比較 (β の確認用): (名前, SMPL 関節 a, b, BVH 関節 a, b)
@@ -154,11 +174,32 @@ class Fitter:
         self.smpl, self.J_rest, self.device = smpl, J_rest, device
         w = cfg.get('weights', {})
         self.w = {k: float(w.get(k, d)) for k, d in
-                  dict(pos=1.0, ori=5.0, offset=0.05, hinge=10.0, prior=1.0, smooth=0.0).items()}
+                  dict(pos=1.0, ori=5.0, offset=0.05, hinge=10.0, prior=1.0, smooth=0.0,
+                       arm_ori=0.0, twist=1.0, twist_limit=100.0, wrist=5.0).items()}
         self.lr = float(cfg.get('lr', 0.01))
         self.pos_w = torch.tensor([CORR[s][1] for s in range(NUM_JOINTS)], device=device)
         self.ori_w = torch.tensor([CORR[s][2] for s in range(NUM_JOINTS)], device=device)
+        self.ori_w[ARM_ORI] *= self.w['arm_ori']
         self.offset_mask = self.pos_w > 0
+        # 肘のねじれ: 骨軸 (レストポーズの肘 -> 手首) と、回内を正にそろえる符号
+        self.elbows = [j for j, _, _ in ELBOW_TWIST]
+        axes = torch.stack([J_rest[c] - J_rest[j] for j, c, _ in ELBOW_TWIST])
+        self.twist_axes = axes / axes.norm(dim=-1, keepdim=True)
+        self.pron_sign = torch.tensor([sg for _, _, sg in ELBOW_TWIST], device=device)
+        lo, hi = np.radians(TWIST_LIMIT_DEG) / 2
+        self.twist_lo, self.twist_hi = float(np.sin(lo)), float(np.sin(hi))
+
+    def elbow_pronation_sin_half(self, R):
+        """肘の局所回転のねじれ (回内を正) の sin(t/2) [T, 2]。"""
+        return twist_sin_half(R[:, self.elbows], self.twist_axes) * self.pron_sign
+
+    def untwist_elbows(self, local):
+        """初期値の肘の局所回転から BVH のねじれを取り除く (weights.arm_ori = 0 のとき)。"""
+        if self.w['arm_ori'] > 0:
+            return local
+        local = local.clone()
+        local[:, self.elbows] = remove_twist(local[:, self.elbows], self.twist_axes)
+        return local
 
     def model_joints(self, R, transl, offsets):
         glob_R, joints = self.smpl.forward_kinematics(R, self.J_rest.expand(R.shape[0], -1, -1))
@@ -175,7 +216,12 @@ class Fitter:
             'offset': ((offsets * 100).pow(2).sum(-1))[self.offset_mask].mean(),
             'hinge': (((R[:, HINGE, 1, 0] - R[:, HINGE, 0, 1]) / 2) ** 2).mean(),
             'prior': ((R[:, PRIOR] - R_init[:, PRIOR]) ** 2).sum((-1, -2)).mean(),
+            'wrist': ((R[:, WRIST] - R_init[:, WRIST]) ** 2).sum((-1, -2)).mean(),
         }
+        if self.w['twist'] > 0 or self.w['twist_limit'] > 0:
+            st = self.elbow_pronation_sin_half(R)
+            L['twist'] = (st ** 2).mean()
+            L['twist_limit'] = (torch.relu(st - self.twist_hi) ** 2 + torch.relu(self.twist_lo - st) ** 2).mean()
         if smooth and self.w['smooth'] > 0 and R.shape[0] > 2:
             acc = joints[2:] - 2 * joints[1:-1] + joints[:-2]
             L['smooth'] = (acc * 100).pow(2).sum(-1).mean()
@@ -249,7 +295,7 @@ def summarize(tag, fit_err, ori_err, foot_h, jitter_ratio, report):
     log(f'  [{tag}] 関節位置の誤差: 平均 {np.nanmean(fit_err):.1f} mm, '
         f'95 パーセンタイル {np.nanpercentile(fit_err, 95):.1f} mm', report)
     log('    ' + ', '.join(f'{names[s]} {m[s]:.1f}' for s in range(NUM_JOINTS) if CORR[s][1] > 0), report)
-    log(f'  [{tag}] グローバル回転の差 [deg]: '
+    log(f'  [{tag}] BVH のグローバル回転との差 [deg] (肘・手首は weights.arm_ori = 0 なら BVH のねじれを使わないため大きい): '
         + ', '.join(f'{names[s]} {o[s]:.1f}' for s in range(NUM_JOINTS) if CORR[s][2] > 0), report)
     fh = foot_h * 1000
     log(f'  [{tag}] 足裏の最下点の高さ [mm] (床 y=0 と仮定): p1 {np.percentile(fh, 1):.1f}, '
@@ -315,6 +361,7 @@ def main():
             G_b, P_t = bvh_targets(bvh, device)
             C = rest_correction(J_rest, bvh, device)
             G_t, local = retarget(G_b, C)
+            local = fitter.untwist_elbows(local)
             data[data_id] = dict(split=split, bvh=bvh, G_t=G_t, P_t=P_t, local=local,
                                  transl=init_transl(smpl, local, J_rest, P_t))
         bone_report(J_rest, data[items[0][0]]['bvh'], report)
@@ -344,7 +391,8 @@ def main():
                 fit_err = ((mocap - d['P_t']).norm(dim=-1) * 1000).cpu().numpy()
                 fit_err[:, ~fitter.offset_mask.cpu().numpy()] = np.nan
                 ori_err = np.degrees(geodesic_angle(glob_R, d['G_t']).cpu().numpy())
-                R[:, 22:24] = torch.eye(3, device=device)       # 手は観測できないので単位回転に固定
+                R[:, HAND_JOINTS] = relaxed_hand_rotmat(device)  # 手は観測できないので固定値 (指を軽く曲げた形)
+                pron = np.degrees(2 * np.arcsin(fitter.elbow_pronation_sin_half(R).clamp(-1, 1).cpu().numpy()))
                 _, joints, _ = fitter.model_joints(R, transl, offsets)
                 poses = matrix_to_axis_angle(R).reshape(T, -1)
                 fh = foot_heights(smpl, R, transl, betas).cpu().numpy()
@@ -353,6 +401,9 @@ def main():
 
             log(f'\n  --- {data_id} ({split}, {T} フレーム) ---', report)
             summarize(data_id, fit_err, ori_err, fh, jr, report)
+            log(f'  [{data_id}] 前腕のねじれ (肘の局所回転, 回内 + / 回外 -) [deg]: '
+                + ', '.join(f'{side} p5 {np.percentile(pron[:, k], 5):.0f} / p50 {np.percentile(pron[:, k], 50):.0f}'
+                            f' / p95 {np.percentile(pron[:, k], 95):.0f}' for k, side in enumerate(('左', '右'))), report)
 
             out = out_root / split / f'{data_id}_smpl.npz'
             out.parent.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 
+from utils.rotation import matrix_to_rot6d
+from utils.smpl import relaxed_hand_rotmat
+
 class PoseDecoder(nn.Module):
     """
     Decodes body latent representation into Joint Positions, 
@@ -70,7 +73,8 @@ class SMPLPoseDecoder(nn.Module):
     出力:
         trans    [B, T, 3]      SMPL の並進 [m] (学習データでは水平 x, z = 0, y は絶対値)
         pose_6d  [B, T, 24, 6]  各関節の局所回転 (6D 表現)。手 (22, 23) は観測できないため
-                                常に単位回転とし、22 関節だけを推定する
+                                固定値 (指を軽く曲げた形, utils.smpl.relaxed_hand_rotmat) とし、
+                                22 関節だけを推定する
         contact  [B, T, 2]      左右の足の接地 (logits)
 
     関節位置・メッシュは学習モデルの外で SMPL (utils/smpl.py) に通して求める
@@ -102,7 +106,8 @@ class SMPLPoseDecoder(nn.Module):
             # 関節位置の損失に引っ張られて膝が骨軸まわりに 180° ねじれた局所解に落ちることがあった)
             self.trans_skip.weight.zero_()
             self.trans_skip.bias.zero_()
-        self.register_buffer('hand_6d', identity_6d.repeat(2, 1), persistent=False)
+        # 手は正解データ (fit_smpl.py) と同じ固定値。state_dict には含めない
+        self.register_buffer('hand_6d', matrix_to_rot6d(relaxed_hand_rotmat()), persistent=False)
 
     def forward(self, body_latent):
         B, T, _ = body_latent.shape

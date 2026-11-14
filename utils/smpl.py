@@ -40,6 +40,20 @@ PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18,
 # 疎センサーからは観測できない手 (22, 23) を除いた 22 関節。学習の損失・評価はこの関節で行う
 BODY_JOINTS = list(range(22))
 
+# 手 (22, 23) の局所回転は推定せず固定する (正解のフィッティング結果・モデルの出力とも同じ値)。
+# 単位回転だと指をまっすぐ伸ばした平らな手になり不自然なので、指を軽く曲げた形にする。
+# レストポーズ (T ポーズ, 手のひらが下) で指先 (左 +x / 右 -x) を手のひら側 (-y) へ曲げる回転は
+# 局所 z 軸まわりで、左は負・右は正の角度になる。
+HAND_JOINTS = [22, 23]
+HAND_CURL_DEG = 25.0
+
+
+def relaxed_hand_rotmat(device=None, dtype=torch.float32):
+    """手 (22, 23) の固定の局所回転 [2, 3, 3] (左, 右)。"""
+    a = np.radians(HAND_CURL_DEG)
+    aa = torch.tensor([[0.0, 0.0, -a], [0.0, 0.0, a]], dtype=dtype, device=device)
+    return axis_angle_to_matrix(aa)
+
 # モデルファイル名の候補 (大文字小文字は区別しない)
 _MODEL_PATTERNS = {
     'male': ['basicmodel_m_lbs_10_207_0_v1.*.pkl', 'smpl_male.pkl', '*_male*.pkl'],

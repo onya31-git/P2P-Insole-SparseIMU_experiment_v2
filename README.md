@@ -28,6 +28,7 @@ uv run evaluate.py               # 評価        → <output_dir>/results/evalua
 uv run visualize.py --end 3000   # 3D 可視化   → ブラウザで visualize.html が開く
 uv run visualize.py --mesh --end 600 --step 3   # SMPL のメッシュも表示 (フレーム数は数百程度に絞る)
 uv run scripts/export_mesh.py --end 300         # メッシュを OBJ と AMASS 形式の npz に書き出す
+uv run mesh_viewer.py                           # SMPL メッシュの Web UI → http://127.0.0.1:8765/ (全フレーム再生可)
 ```
 
 `<output_dir>` は `config.yaml` の `paths.output_dir` (既定 `outputs/smpl`)。
@@ -58,6 +59,8 @@ uv run scripts/export_mesh.py --end 300         # メッシュを OBJ と AMASS 
 ├── evaluate.py           予測 CSV から MPJPE などを計算
 ├── visualize.py          予測と正解のスケルトンをブラウザで表示 (visualize.html を使用)
 ├── visualize.html
+├── mesh_viewer.py        予測と正解の SMPL メッシュを確認する Web UI のサーバー (target: smpl)
+├── mesh_viewer.html      その画面 (three.js)
 ├── pyproject.toml        依存ライブラリ (uv)
 ├── uv.lock
 │
@@ -129,7 +132,10 @@ uv run scripts/export_mesh.py --end 300         # メッシュを OBJ と AMASS 
    - 段階 1: 間引いたフレームで、SMPL と mocap の関節の定義の差 (被験者ごとに一定のオフセット) を推定
    - 段階 2: オフセットを固定して全フレームの姿勢・並進を推定
      (関節位置 + BVH のグローバル回転 (骨軸まわりのねじれを決める) + 膝・肘のヒンジ性など)
-   - β は config の値で固定。手 (22, 23) は観測できないので単位回転
+   - 前腕の骨軸まわりのねじれ (回内・回外) は BVH の値が信頼できない (可動域を超える・左右で中心がずれる) ため使わず、
+     中間位 (T ポーズで手のひらが下) に寄せて可動域内に制限する。手首は BVH の局所回転 (前腕に対する屈曲など) に合わせる。
+     手のひらの向きは実測ではなく推定である点に注意 (`config.yaml` の `fit_smpl.weights.arm_ori` などで調整)
+   - β は config の値で固定。手 (22, 23) は観測できないので固定値 (指を軽く曲げた形, 予測も同じ値)
 5. **モデル** (`models/system.py`)
 
    ```

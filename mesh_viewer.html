@@ -1,0 +1,966 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMPL メッシュビューア</title>
+<!-- mesh_viewer.py が配信する (直接ファイルとして開いても API が無いので動かない) -->
+<style>
+  :root {
+    --bg: #0e1014;
+    --panel: #161920;
+    --panel-2: #1d2129;
+    --line: #2a2f3a;
+    --text: #e7e9ee;
+    --muted: #98a1b0;
+    --faint: #6b7383;
+    --pred: #5b9dff;
+    --gt: #f0a35e;
+    --accent: #5b9dff;
+    --warn: #ff7a6b;
+    --ok: #47c98f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    grid-template-rows: 46px minmax(0, 1fr) auto;
+    grid-template-areas: "top top" "view side" "time time";
+    height: 100vh; overflow: hidden;
+  }
+  button, select, input { font: inherit; color: inherit; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ---------- header ---------- */
+  header {
+    grid-area: top; display: flex; align-items: center; gap: 18px;
+    padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    white-space: nowrap; overflow: hidden;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  header .info { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+  header .legend { margin-left: auto; display: flex; gap: 14px; color: var(--muted); }
+  .chip { display: inline-flex; align-items: center; gap: 6px; }
+  .chip::before { content: ""; width: 10px; height: 10px; border-radius: 3px; background: var(--c); }
+
+  /* ---------- 3D view ---------- */
+  #view { grid-area: view; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+  #view canvas { display: block; width: 100%; height: 100%; outline: none; }
+  .badge {
+    position: absolute; padding: 4px 10px; border-radius: 6px; font-size: 12px;
+    background: rgba(22, 25, 32, .85); border: 1px solid var(--line); pointer-events: none;
+  }
+  #buffering { top: 12px; left: 12px; display: none; }
+  #buffering.on { display: block; }
+  #buffering::before {
+    content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 7px; vertical-align: -1px;
+    border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .label3d { transform: translate(-50%, -100%); font-weight: 600; display: none; }
+  #heatLegend { right: 12px; bottom: 12px; display: none; width: 190px; }
+  #heatLegend.on { display: block; }
+  #heatLegend .bar { height: 8px; border-radius: 3px; margin: 6px 0 3px; }
+  #heatLegend .ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  #camBtns { position: absolute; left: 12px; bottom: 12px; display: flex; gap: 4px; }
+  #camBtns button {
+    padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    background: rgba(22, 25, 32, .85); border: 1px solid var(--line);
+  }
+  #camBtns button:hover { border-color: var(--faint); }
+  #loading {
+    position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+    background: var(--bg); z-index: 5;
+  }
+  #loading.error { color: var(--warn); white-space: pre-wrap; padding: 24px; text-align: center; }
+
+  /* ---------- sidebar ---------- */
+  aside { grid-area: side; overflow-y: auto; background: var(--panel); border-left: 1px solid var(--line); }
+  section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  section h2 { font-size: 11px; font-weight: 600; color: var(--muted); margin: 0 0 10px; letter-spacing: .06em; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 8px 0; }
+  .row > span:first-child { color: var(--muted); }
+  .seg { display: flex; background: var(--panel-2); border: 1px solid var(--line); border-radius: 7px; padding: 2px; gap: 2px; }
+  .seg button {
+    flex: 1; border: 0; background: transparent; padding: 4px 6px; border-radius: 5px; cursor: pointer;
+    color: var(--muted); font-size: 12px; white-space: nowrap;
+  }
+  .seg button.on { background: #2c3340; color: var(--text); }
+  .seg.full { width: 100%; }
+  input[type=range] { width: 130px; accent-color: var(--accent); }
+  label.check { display: flex; align-items: center; gap: 8px; margin: 7px 0; cursor: pointer; }
+  input[type=checkbox] { accent-color: var(--accent); margin: 0; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .stat .k { color: var(--muted); font-size: 11px; }
+  .stat .v { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  .stat .v small { font-size: 11px; font-weight: 400; color: var(--muted); margin-left: 2px; }
+  .stat .sub { color: var(--faint); font-size: 11px; }
+  .contact { display: grid; grid-template-columns: 22px 1fr 44px 52px; align-items: center; gap: 8px; margin: 6px 0; }
+  .contact .meter { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; border: 1px solid var(--line); }
+  .contact .meter i { display: block; height: 100%; background: var(--pred); width: 0; }
+  .contact .p { text-align: right; color: var(--muted); }
+  .pill { font-size: 11px; text-align: center; border-radius: 10px; padding: 1px 0; border: 1px solid var(--line); color: var(--faint); }
+  .pill.on { background: rgba(240, 163, 94, .18); border-color: var(--gt); color: var(--gt); }
+  .jlist { display: grid; gap: 5px; }
+  .jrow { display: grid; grid-template-columns: 76px 1fr 68px; align-items: center; gap: 8px; font-size: 12px; }
+  .jrow .bar { height: 6px; border-radius: 3px; background: var(--warn); opacity: .8; }
+  .jrow .v { text-align: right; color: var(--muted); white-space: nowrap; }
+  .worst { display: grid; gap: 2px; }
+  .worst button {
+    display: grid; grid-template-columns: 1fr auto; gap: 8px; text-align: left; cursor: pointer;
+    background: transparent; border: 0; padding: 5px 6px; border-radius: 5px;
+  }
+  .worst button:hover { background: var(--panel-2); }
+  .worst .v { color: var(--warn); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; text-align: right; }
+  .hint { color: var(--faint); font-size: 11px; line-height: 1.7; }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; color: var(--muted); }
+
+  /* ---------- timeline ---------- */
+  #timeline { grid-area: time; background: var(--panel); border-top: 1px solid var(--line); padding: 8px 16px 10px; }
+  .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .iconbtn {
+    width: 32px; height: 28px; display: grid; place-items: center; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+  }
+  .iconbtn:hover { border-color: var(--faint); }
+  .iconbtn svg { width: 14px; height: 14px; fill: currentColor; }
+  #frameInput {
+    width: 84px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; text-align: right;
+  }
+  select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 4px; }
+  .controls .spacer { flex: 1; }
+  .controls .muted { color: var(--muted); }
+  .textbtn { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; color: var(--muted); }
+  .textbtn:hover { color: var(--text); border-color: var(--faint); }
+  #chartWrap { position: relative; height: 136px; margin-top: 8px; }
+  #chartWrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #chartOverlay { cursor: crosshair; touch-action: none; }
+
+  @media (max-width: 860px) {
+    body {
+      grid-template-columns: 1fr; grid-template-rows: 46px 55vh auto auto;
+      grid-template-areas: "top" "view" "time" "side"; height: auto; overflow: auto;
+    }
+    aside { border-left: 0; overflow: visible; }
+    header .legend { display: none; }
+  }
+</style>
+<script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+</script>
+</head>
+<body>
+<header>
+  <h1>SMPL メッシュビューア</h1>
+  <span class="info" id="info"></span>
+  <span class="legend">
+    <span class="chip" style="--c: var(--pred)">予測</span>
+    <span class="chip" style="--c: var(--gt)">正解 (SMPL フィッティング)</span>
+  </span>
+</header>
+
+<main id="view">
+  <div id="loading">データを読み込んでいます…</div>
+  <div class="badge" id="buffering">メッシュを計算中…</div>
+  <div class="badge label3d" id="labelPred" style="color: var(--pred)">予測</div>
+  <div class="badge label3d" id="labelGt" style="color: var(--gt)">正解</div>
+  <div class="badge" id="heatLegend">
+    頂点の誤差 (予測 − 正解)
+    <div class="bar" id="heatBar"></div>
+    <div class="ends"><span>0 mm</span><span id="heatMaxLabel">100 mm</span></div>
+  </div>
+  <div id="camBtns">
+    <button data-cam="front">正面</button>
+    <button data-cam="side">左側面</button>
+    <button data-cam="back">背面</button>
+    <button data-cam="top">上</button>
+    <button id="shotBtn" title="現在の画面を PNG で保存">画像を保存</button>
+  </div>
+</main>
+
+<aside>
+  <section>
+    <h2>表示</h2>
+    <div class="seg full" id="layoutSeg">
+      <button data-v="overlay">重ねる</button>
+      <button data-v="side">並べる</button>
+      <button data-v="pred">予測のみ</button>
+      <button data-v="gt">正解のみ</button>
+    </div>
+    <div class="row">
+      <span>予測の色</span>
+      <div class="seg" id="colorSeg">
+        <button data-v="solid">単色</button>
+        <button data-v="heat">誤差</button>
+      </div>
+    </div>
+    <div class="row">
+      <span>誤差の上限</span>
+      <span><input type="range" id="heatMax" min="20" max="200" step="10"> <span class="num" id="heatMaxVal"></span></span>
+    </div>
+    <div class="row">
+      <span>正解の不透明度</span>
+      <input type="range" id="gtOpacity" min="0.1" max="1" step="0.05">
+    </div>
+    <label class="check"><input type="checkbox" id="skeleton"> スケルトン (SMPL の 24 関節)</label>
+    <label class="check"><input type="checkbox" id="wire"> ワイヤーフレーム</label>
+    <label class="check"><input type="checkbox" id="markers"> 接地マーカー (足元)</label>
+  </section>
+
+  <section>
+    <h2>現在のフレーム</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">MPJPE (22 関節)</div><div class="v num"><span id="sMpjpe">–</span><small>mm</small></div></div>
+      <div class="stat"><div class="k">PVE (頂点)</div><div class="v num"><span id="sPve">–</span><small>mm</small></div></div>
+      <div class="stat"><div class="k">腰の高さ 予測</div><div class="v num"><span id="sRootP">–</span><small>mm</small></div>
+        <div class="sub num">正解 <span id="sRootG">–</span> mm</div></div>
+      <div class="stat"><div class="k">腰の高さの誤差</div><div class="v num"><span id="sRootE">–</span><small>mm</small></div></div>
+    </div>
+    <div style="margin-top: 12px">
+      <div class="contact"><span>左</span><div class="meter"><i id="cLbar"></i></div><span class="p num" id="cLp"></span><span class="pill" id="cLg">正解</span></div>
+      <div class="contact"><span>右</span><div class="meter"><i id="cRbar"></i></div><span class="p num" id="cRp"></span><span class="pill" id="cRg">正解</span></div>
+      <div class="hint">バー: 予測の接地確率 / 右端: 正解の接地</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>誤差の大きい関節 (現在のフレーム)</h2>
+    <div class="jlist" id="jointList"></div>
+  </section>
+
+  <section>
+    <h2>誤差の大きい区間 (クリックで移動)</h2>
+    <div class="worst" id="worstList"></div>
+  </section>
+
+  <section>
+    <h2>全体</h2>
+    <dl class="kv" id="summary"></dl>
+  </section>
+
+  <section>
+    <div class="hint">
+      <kbd>Space</kbd> 再生 / 停止　<kbd>←</kbd><kbd>→</kbd> 1 フレーム<br>
+      <kbd>Shift</kbd>+<kbd>←</kbd><kbd>→</kbd> 1 秒　<kbd>Home</kbd><kbd>End</kbd> 先頭 / 末尾<br>
+      3D: 左ドラッグで回転 / 右ドラッグで移動 / ホイールで拡大<br>
+      正面・左側面などは現在のフレームの人の向きが基準<br>
+      タイムライン: クリック・ドラッグで移動 / ホイールで拡大
+    </div>
+  </section>
+</aside>
+
+<footer id="timeline">
+  <div class="controls">
+    <button class="iconbtn" id="prevBtn" title="1 フレーム戻る (←)"><svg viewBox="0 0 16 16"><path d="M3 2h2v12H3zM14 2v12L6 8z"/></svg></button>
+    <button class="iconbtn" id="playBtn" title="再生 / 停止 (Space)"><svg viewBox="0 0 16 16" id="playIcon"><path d="M4 2l10 6-10 6z"/></svg></button>
+    <button class="iconbtn" id="nextBtn" title="1 フレーム進む (→)"><svg viewBox="0 0 16 16"><path d="M11 2h2v12h-2zM2 2v12l8-6z"/></svg></button>
+    <span class="num"><input type="number" id="frameInput" min="0" step="1"> <span class="muted">/ <span id="frameTotal"></span></span></span>
+    <span class="num muted" id="timeLabel"></span>
+    <label class="muted">速度
+      <select id="speed">
+        <option value="0.1">0.1×</option>
+        <option value="0.25">0.25×</option>
+        <option value="0.5">0.5×</option>
+        <option value="1">1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+      </select>
+    </label>
+    <label class="check muted" style="margin: 0"><input type="checkbox" id="loop"> ループ</label>
+    <span class="spacer"></span>
+    <span class="num muted" id="rangeLabel"></span>
+    <button class="textbtn" id="zoomReset">全体を表示</button>
+  </div>
+  <div id="chartWrap">
+    <canvas id="chart"></canvas>
+    <canvas id="chartOverlay"></canvas>
+  </div>
+</footer>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = (s) => document.querySelector(s);
+const fmt = (x, d = 0) => Number(x).toLocaleString('ja-JP', { minimumFractionDigits: d, maximumFractionDigits: d });
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+
+const JOINT_JA = {
+  pelvis: '骨盤', left_hip: '左股関節', right_hip: '右股関節', spine1: '脊椎 1', left_knee: '左膝', right_knee: '右膝',
+  spine2: '脊椎 2', left_ankle: '左足首', right_ankle: '右足首', spine3: '脊椎 3', left_foot: '左つま先', right_foot: '右つま先',
+  neck: '首', left_collar: '左鎖骨', right_collar: '右鎖骨', head: '頭', left_shoulder: '左肩', right_shoulder: '右肩',
+  left_elbow: '左肘', right_elbow: '右肘', left_wrist: '左手首', right_wrist: '右手首', left_hand: '左手', right_hand: '右手',
+};
+const COLORS = { pred: 0x5b9dff, gt: 0xf0a35e, bg: 0x0e1014 };
+
+// ------------------------------------------------------------------
+// データの読み込み
+// ------------------------------------------------------------------
+let meta, faces, seriesRaw;
+try {
+  const get = async (url, kind) => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+    return kind === 'json' ? r.json() : r.arrayBuffer();
+  };
+  const [m, f, s] = await Promise.all([get('api/meta', 'json'), get('api/faces'), get('api/series')]);
+  meta = m; faces = new Uint32Array(f); seriesRaw = new Float32Array(s);
+} catch (e) {
+  const el = $('#loading');
+  el.classList.add('error');
+  el.textContent = `データを読み込めませんでした。\n「uv run mesh_viewer.py」で起動したサーバーから開いてください。\n\n${e.message}`;
+  throw e;
+}
+
+const N = meta.frames, V = meta.verts, J = meta.joints, CH = meta.chunk, FPS = meta.fps;
+const BODY_STRIDE = V * 3 + J * 3, FRAME_STRIDE = 2 * BODY_STRIDE;
+const S = {};
+meta.series.forEach((name, k) => {
+  const a = new Float32Array(N);
+  for (let i = 0; i < N; i++) a[i] = seriesRaw[i * meta.series.length + k];
+  S[name] = a;
+});
+
+// ------------------------------------------------------------------
+// 設定 (ブラウザに保存)
+// ------------------------------------------------------------------
+const DEFAULTS = { layout: 'overlay', color: 'solid', heatMax: 100, gtOpacity: 0.35,
+                   skeleton: false, wire: false, markers: true, speed: 1, loop: true };
+const state = { ...DEFAULTS, playing: false, cur: 0, shown: -1, pve: NaN };
+try { Object.assign(state, JSON.parse(localStorage.getItem('smpl-mesh-viewer') || '{}')); } catch (e) { /* 保存なし */ }
+// URL で初期表示を指定できる (例: /?frame=41000&layout=side&color=heat&cam=side)
+const params = new URLSearchParams(location.search);
+if (params.has('frame')) state.cur = clamp(Number(params.get('frame')) || 0, 0, N - 1);
+if (['overlay', 'side', 'pred', 'gt'].includes(params.get('layout'))) state.layout = params.get('layout');
+if (['solid', 'heat'].includes(params.get('color'))) state.color = params.get('color');
+if (params.has('skeleton')) state.skeleton = params.get('skeleton') !== '0';
+function saveSettings() {
+  try {
+    const o = {}; for (const k of Object.keys(DEFAULTS)) o[k] = state[k];
+    localStorage.setItem('smpl-mesh-viewer', JSON.stringify(o));
+  } catch (e) { /* 保存できない環境 */ }
+}
+
+// ------------------------------------------------------------------
+// three.js のシーン
+// ------------------------------------------------------------------
+const view = $('#view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+view.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(COLORS.bg);
+// ズームの範囲を制限する。以前は制限がなく、ホイールで遠ざかると
+//   - 視錐台の奥 (far) を超えてメッシュがクリップされて消える
+//   - near が小さすぎて遠方の深度の精度が落ち、少し手前に寄せて描いている正解のメッシュが
+//     予測のメッシュを覆い隠す (予測が白っぽく見える)
+// ことがあった。near / far と最大距離は、深度の精度が 1 mm 程度に保たれるように選んでいる
+const CAM_MIN_DIST = 0.5, CAM_MAX_DIST = 15;
+const camera = new THREE.PerspectiveCamera(35, 1, 0.05, CAM_MAX_DIST * 4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+controls.minDistance = CAM_MIN_DIST;
+controls.maxDistance = CAM_MAX_DIST;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.6));
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(2, 4, 3); scene.add(key);
+const fill = new THREE.DirectionalLight(0xbfd2ff, 0.9); fill.position.set(-3, 2, -2); scene.add(fill);
+const grid = new THREE.GridHelper(8, 32, 0x3a4150, 0x232831);
+grid.material.transparent = true; grid.material.opacity = 0.8;
+scene.add(grid);
+const floor = new THREE.Mesh(new THREE.CircleGeometry(4, 64), new THREE.MeshBasicMaterial({ color: 0x13161c }));
+floor.rotation.x = -Math.PI / 2; floor.position.y = -0.002; scene.add(floor);
+
+// 誤差のカラーマップ (淡い灰 → 黄 → 橙 → 赤)。three の頂点色は線形空間なので変換しておく
+const HEAT_STOPS = [[0, '#e9edf3'], [0.33, '#f7d26a'], [0.66, '#f08a3c'], [1, '#c8283a']];
+const HEAT_LUT = new Float32Array(256 * 3);
+{
+  const c = new THREE.Color(), a = new THREE.Color(), b = new THREE.Color();
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 0; while (k < HEAT_STOPS.length - 2 && t > HEAT_STOPS[k + 1][0]) k++;
+    const [t0, c0] = HEAT_STOPS[k], [t1, c1] = HEAT_STOPS[k + 1];
+    a.set(c0); b.set(c1);
+    c.copy(a).lerp(b, (t - t0) / (t1 - t0));
+    HEAT_LUT.set([c.r, c.g, c.b], i * 3);
+  }
+  $('#heatBar').style.background = `linear-gradient(90deg, ${HEAT_STOPS.map(([t, c]) => `${c} ${t * 100}%`).join(', ')})`;
+}
+
+const FEET = [[7, 10], [8, 11]];   // 左右の (足首, つま先)
+function makeBody(color, markerKind) {
+  const group = new THREE.Group();
+  const geo = new THREE.BufferGeometry();
+  const attr = () => new THREE.BufferAttribute(new Float32Array(V * 3), 3).setUsage(THREE.DynamicDrawUsage);
+  const pos = attr(), nrm = attr(), col = attr();
+  geo.setAttribute('position', pos);
+  geo.setAttribute('normal', nrm);
+  geo.setAttribute('color', col);
+  geo.setIndex(new THREE.BufferAttribute(faces, 1));
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.0 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  group.add(mesh);
+
+  // スケルトン (メッシュに隠れないよう最前面に描く)
+  const skel = new THREE.Group();
+  const jointMat = new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true });
+  const joints = new THREE.InstancedMesh(new THREE.SphereGeometry(0.017, 12, 8), jointMat, J);
+  const boneGeo = new THREE.BufferGeometry();
+  const bonePos = new THREE.BufferAttribute(new Float32Array((J - 1) * 6), 3).setUsage(THREE.DynamicDrawUsage);
+  boneGeo.setAttribute('position', bonePos);
+  const bones = new THREE.LineSegments(boneGeo, new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true }));
+  for (const o of [joints, bones]) { o.renderOrder = 10; o.frustumCulled = false; skel.add(o); }
+  group.add(skel);
+
+  // 足元の接地マーカー (予測: 塗りつぶしの円, 濃さ = 接地確率 / 正解: 輪)
+  const markers = new THREE.Group();
+  const marks = [0, 1].map(() => {
+    const g = markerKind === 'disc' ? new THREE.CircleGeometry(0.075, 40) : new THREE.RingGeometry(0.082, 0.1, 40);
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color, transparent: true, depthWrite: false }));
+    m.rotation.x = -Math.PI / 2;
+    m.renderOrder = 1;
+    markers.add(m);
+    return m;
+  });
+  group.add(markers);
+
+  scene.add(group);
+  return { group, geo, mesh, mat, pos, col, skel, joints, bones, bonePos, markers, marks,
+           jp: new Float32Array(J * 3) };
+}
+const pred = makeBody(COLORS.pred, 'disc');
+const gt = makeBody(COLORS.gt, 'ring');
+const tmpM = new THREE.Matrix4();
+
+function writeBody(b, data, off) {
+  const p = b.pos.array;
+  for (let i = 0; i < V * 3; i++) p[i] = data[off + i] * 0.001;
+  const jo = off + V * 3, jp = b.jp;
+  for (let i = 0; i < J * 3; i++) jp[i] = data[jo + i] * 0.001;
+  b.pos.needsUpdate = true;
+  b.geo.computeVertexNormals();
+  if (state.skeleton) {
+    for (let j = 0; j < J; j++) {
+      b.joints.setMatrixAt(j, tmpM.makeTranslation(jp[3 * j], jp[3 * j + 1], jp[3 * j + 2]));
+    }
+    b.joints.instanceMatrix.needsUpdate = true;
+    const bp = b.bonePos.array;
+    for (let j = 1; j < J; j++) {
+      const p0 = meta.parents[j], o = (j - 1) * 6;
+      bp.set(jp.subarray(3 * p0, 3 * p0 + 3), o);
+      bp.set(jp.subarray(3 * j, 3 * j + 3), o + 3);
+    }
+    b.bonePos.needsUpdate = true;
+  }
+  FEET.forEach(([a, t], s) => {
+    b.marks[s].position.set((jp[3 * a] + jp[3 * t]) / 2, 0.003, (jp[3 * a + 2] + jp[3 * t + 2]) / 2);
+  });
+}
+
+// ------------------------------------------------------------------
+// メッシュのチャンク (サーバーで計算) の取得とキャッシュ
+// ------------------------------------------------------------------
+const MAX_CACHE = 24, MAX_INFLIGHT = 2;
+const cache = new Map();      // チャンク番号 -> Int16Array (挿入順 = 最近使った順)
+const inflight = new Set();
+const NCHUNK = Math.ceil(N / CH);
+
+function getChunk(c) {
+  const d = cache.get(c);
+  if (d) { cache.delete(c); cache.set(c, d); }
+  return d;
+}
+const hasFrame = (f) => cache.has(Math.floor(f / CH));
+
+function ensureChunks(f) {
+  const c0 = Math.floor(f / CH);
+  const ahead = state.playing ? 1 + Math.ceil(state.speed) : 1;
+  for (let c = c0; c <= Math.min(c0 + ahead, NCHUNK - 1); c++) {
+    if (cache.has(c) || inflight.has(c)) continue;
+    if (inflight.size >= MAX_INFLIGHT) break;
+    inflight.add(c);
+    fetch(`api/chunk?c=${c}`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
+      .then((buf) => {
+        cache.set(c, new Int16Array(buf));
+        while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value);
+      })
+      .catch((e) => console.error('chunk', c, e))
+      .finally(() => inflight.delete(c));
+  }
+}
+
+// ------------------------------------------------------------------
+// フレームの表示
+// ------------------------------------------------------------------
+function showFrame(f) {
+  const c = Math.floor(f / CH);
+  const data = getChunk(c);
+  if (!data) return false;
+  const base = (f - c * CH) * FRAME_STRIDE;
+  writeBody(pred, data, base);
+  writeBody(gt, data, base + BODY_STRIDE);
+
+  // 頂点ごとの誤差 (PVE とヒートマップ)
+  const pa = pred.pos.array, ga = gt.pos.array, ca = pred.col.array;
+  const heat = state.color === 'heat', scale = 255 / state.heatMax;
+  let sum = 0;
+  for (let v = 0, i = 0; v < V; v++, i += 3) {
+    const dx = pa[i] - ga[i], dy = pa[i + 1] - ga[i + 1], dz = pa[i + 2] - ga[i + 2];
+    const e = Math.sqrt(dx * dx + dy * dy + dz * dz) * 1000;
+    sum += e;
+    if (heat) {
+      const k = Math.min(255, (e * scale) | 0) * 3;
+      ca[i] = HEAT_LUT[k]; ca[i + 1] = HEAT_LUT[k + 1]; ca[i + 2] = HEAT_LUT[k + 2];
+    }
+  }
+  if (heat) pred.col.needsUpdate = true;
+  state.pve = sum / V;
+
+  // 接地マーカー
+  const pc = [S.pred_contact_l[f], S.pred_contact_r[f]];
+  const gc = [S.gt_contact_l[f], S.gt_contact_r[f]];
+  pred.marks.forEach((m, s) => { m.material.opacity = 0.15 + 0.7 * pc[s]; });
+  gt.marks.forEach((m, s) => { m.visible = gc[s] > 0.5; });
+
+  state.shown = f;
+  updateFramePanel(f);
+  return true;
+}
+
+function updateFramePanel(f) {
+  $('#frameInput').value = f;
+  $('#timeLabel').textContent = `${fmt(f / FPS, 2)} s`;
+  $('#sMpjpe').textContent = fmt(S.mpjpe[f], 1);
+  $('#sPve').textContent = fmt(state.pve, 1);
+  $('#sRootP').textContent = fmt(S.pred_root_y[f]);
+  $('#sRootG').textContent = fmt(S.gt_root_y[f]);
+  $('#sRootE').textContent = fmt(S.root_err[f], 1);
+  for (const [s, key] of [['L', 'l'], ['R', 'r']]) {
+    const p = S[`pred_contact_${key}`][f], g = S[`gt_contact_${key}`][f] > 0.5;
+    $(`#c${s}bar`).style.width = `${p * 100}%`;
+    $(`#c${s}p`).textContent = `${fmt(p * 100)}%`;
+    const pill = $(`#c${s}g`);
+    pill.classList.toggle('on', g);
+    pill.textContent = g ? '接地' : '離地';
+  }
+  // 関節ごとの誤差 (手を除く 22 関節)
+  const errs = meta.body_joints.map((j) => {
+    const a = pred.jp, b = gt.jp, i = 3 * j;
+    return [j, Math.hypot(a[i] - b[i], a[i + 1] - b[i + 1], a[i + 2] - b[i + 2]) * 1000];
+  }).sort((x, y) => y[1] - x[1]).slice(0, 6);
+  const top = Math.max(errs[0][1], 1);
+  $('#jointList').innerHTML = errs.map(([j, e]) => `
+    <div class="jrow"><span>${JOINT_JA[meta.joint_names[j]] || meta.joint_names[j]}</span>
+    <div><div class="bar" style="width:${(e / top) * 100}%"></div></div>
+    <span class="v num">${fmt(e, 1)} mm</span></div>`).join('');
+}
+
+// ------------------------------------------------------------------
+// 表示設定
+// ------------------------------------------------------------------
+function applyLayout() {
+  const L = state.layout;
+  pred.group.visible = L !== 'gt';
+  gt.group.visible = L !== 'pred';
+  if (L !== 'side') { pred.group.position.set(0, 0, 0); gt.group.position.set(0, 0, 0); }
+  applyMaterials();
+}
+function applyMaterials() {
+  const heat = state.color === 'heat';
+  pred.mat.vertexColors = heat;
+  pred.mat.color.set(heat ? 0xffffff : COLORS.pred);
+  const op = state.layout === 'overlay' ? state.gtOpacity : 1;
+  gt.mat.transparent = op < 1;
+  gt.mat.opacity = op;
+  gt.mat.depthWrite = op >= 1;
+  // 重ねると予測と正解の面がほぼ一致する箇所で z-fighting が起きるため、正解を少し手前に寄せて描く
+  gt.mat.polygonOffset = state.layout === 'overlay';
+  gt.mat.polygonOffsetFactor = -1;
+  gt.mat.polygonOffsetUnits = -4;
+  for (const b of [pred, gt]) {
+    b.mat.wireframe = state.wire;
+    b.mat.needsUpdate = true;
+    b.skel.visible = state.skeleton;
+    b.markers.visible = state.markers;
+  }
+  $('#heatLegend').classList.toggle('on', heat && state.layout !== 'gt');
+  $('#heatMaxLabel').textContent = `${state.heatMax} mm`;
+  $('#heatMaxVal').textContent = `${state.heatMax} mm`;
+  state.shown = -1;   // ヒートマップ・スケルトンを描き直す
+}
+
+function bindSeg(id, prop) {
+  const seg = $(id);
+  const sync = () => seg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.v === state[prop]));
+  seg.addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    state[prop] = b.dataset.v; sync(); applyLayout(); saveSettings();
+  });
+  sync();
+}
+bindSeg('#layoutSeg', 'layout');
+bindSeg('#colorSeg', 'color');
+for (const [id, prop] of [['#heatMax', 'heatMax'], ['#gtOpacity', 'gtOpacity']]) {
+  const el = $(id);
+  el.value = state[prop];
+  el.addEventListener('input', () => { state[prop] = Number(el.value); applyMaterials(); saveSettings(); });
+}
+for (const id of ['skeleton', 'wire', 'markers', 'loop']) {
+  const el = $(`#${id}`);
+  el.checked = state[id];
+  el.addEventListener('change', () => { state[id] = el.checked; applyMaterials(); saveSettings(); });
+}
+const speedSel = $('#speed');
+speedSel.value = String(state.speed);
+if (!speedSel.value) speedSel.value = '1';
+state.speed = Number(speedSel.value);
+speedSel.addEventListener('change', () => { state.speed = Number(speedSel.value); saveSettings(); });
+applyLayout();
+
+// カメラ: 現在のフレームの正解の向き (左右の股関節から求めた正面方向) を基準にする。
+// SMPL は y が上, +x が左, +z が正面なので 正面 = 左 × 上 = (-left.z, 0, left.x)
+function facing() {
+  const jp = gt.jp, lx = jp[3] - jp[6], lz = jp[5] - jp[8], n = Math.hypot(lx, lz);
+  return n > 1e-6 ? new THREE.Vector3(-lz / n, 0, lx / n) : new THREE.Vector3(0, 0, 1);
+}
+let camPending = params.get('cam') || 'front';
+function setCam(name) {
+  if (state.shown < 0) { camPending = name; return; }   // 最初のフレームが届いてから合わせる
+  const fwd = facing(), left = new THREE.Vector3(fwd.z, 0, -fwd.x);
+  const dir = { front: fwd, back: fwd.clone().negate(), side: left }[name];
+  const target = new THREE.Vector3(0, 0.9, 0);
+  if (name === 'top') camera.position.copy(target).addScaledVector(fwd, 0.6).setY(5.2);
+  else camera.position.copy(target).addScaledVector(dir, 4.6).setY(1.05);
+  controls.target.copy(target); controls.update();
+}
+$('#camBtns').addEventListener('click', (e) => { const b = e.target.closest('[data-cam]'); if (b) setCam(b.dataset.cam); });
+$('#shotBtn').addEventListener('click', () => {
+  renderer.render(scene, camera);   // 描画直後なら preserveDrawingBuffer なしで読み出せる
+  const a = document.createElement('a');
+  a.href = renderer.domElement.toDataURL('image/png');
+  a.download = `smpl_frame_${String(state.shown).padStart(6, '0')}.png`;
+  a.click();
+});
+
+// ------------------------------------------------------------------
+// 再生操作
+// ------------------------------------------------------------------
+function seek(f) { state.cur = clamp(Math.round(f), 0, N - 1); }
+function setPlaying(p) {
+  state.playing = p;
+  $('#playIcon').innerHTML = p ? '<path d="M3 2h4v12H3zM9 2h4v12H9z"/>' : '<path d="M4 2l10 6-10 6z"/>';
+}
+$('#playBtn').addEventListener('click', () => {
+  if (!state.playing && Math.floor(state.cur) >= N - 1) seek(0);
+  setPlaying(!state.playing);
+});
+$('#prevBtn').addEventListener('click', () => { setPlaying(false); seek(state.cur - 1); });
+$('#nextBtn').addEventListener('click', () => { setPlaying(false); seek(state.cur + 1); });
+$('#frameTotal').textContent = fmt(N - 1);
+$('#frameInput').max = N - 1;
+$('#frameInput').addEventListener('change', (e) => { setPlaying(false); seek(Number(e.target.value) || 0); });
+window.addEventListener('keydown', (e) => {
+  if (e.target.matches('input[type=number], select')) return;
+  const step = e.shiftKey ? Math.round(FPS) : 1;
+  if (e.code === 'Space') { e.preventDefault(); $('#playBtn').click(); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); setPlaying(false); seek(Math.floor(state.cur) - step); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); setPlaying(false); seek(Math.floor(state.cur) + step); }
+  else if (e.key === 'Home') { seek(0); }
+  else if (e.key === 'End') { seek(N - 1); }
+});
+
+// ------------------------------------------------------------------
+// タイムライン (MPJPE と接地)
+// ------------------------------------------------------------------
+const chartC = $('#chart'), overC = $('#chartOverlay');
+const cctx = chartC.getContext('2d'), octx = overC.getContext('2d');
+const PAD_L = 52, PAD_R = 8, PLOT_T = 6, PLOT_H = 70, STRIP_T = 86, STRIP_H = 10, STRIP_GAP = 2;
+const STRIPS = [
+  ['L 正解', 'gt_contact_l', '#f0a35e'], ['L 予測', 'pred_contact_l', '#5b9dff'],
+  ['R 正解', 'gt_contact_r', '#f0a35e'], ['R 予測', 'pred_contact_r', '#5b9dff'],
+];
+const tl = { v0: 0, v1: N, w: 0, h: 0, hover: -1, dragging: false, yMax: 100 };
+const plotW = () => tl.w - PAD_L - PAD_R;
+const f2x = (f) => PAD_L + ((f - tl.v0) / (tl.v1 - tl.v0)) * plotW();
+const x2f = (x) => tl.v0 + ((x - PAD_L) / plotW()) * (tl.v1 - tl.v0);
+function niceCeil(x) {
+  const p = 10 ** Math.floor(Math.log10(Math.max(x, 1e-6)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= x) return m * p;
+  return 10 * p;
+}
+
+function resizeChart() {
+  const r = $('#chartWrap').getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  tl.w = r.width; tl.h = r.height;
+  for (const [c, ctx] of [[chartC, cctx], [overC, octx]]) {
+    c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  drawChart();
+}
+
+function drawChart() {
+  const ctx = cctx, W = plotW(), cols = Math.max(1, Math.floor(W));
+  ctx.clearRect(0, 0, tl.w, tl.h);
+  const span = tl.v1 - tl.v0;
+  const mean = new Float32Array(cols), max = new Float32Array(cols);
+  const strip = STRIPS.map(() => new Float32Array(cols));
+  for (let i = 0; i < cols; i++) {
+    const a = Math.floor(tl.v0 + (i / cols) * span);
+    const b = Math.max(a + 1, Math.floor(tl.v0 + ((i + 1) / cols) * span));
+    let s = 0, m = 0;
+    const st = STRIPS.map(() => 0);
+    for (let f = a; f < b && f < N; f++) {
+      const e = S.mpjpe[f]; s += e; if (e > m) m = e;
+      STRIPS.forEach(([, k], q) => { if (S[k][f] > 0.5) st[q]++; });
+    }
+    const n = Math.max(1, Math.min(b, N) - a);
+    mean[i] = s / n; max[i] = m;
+    st.forEach((c, q) => { strip[q][i] = c / n; });
+  }
+  const sorted = Float32Array.from(max).sort();
+  tl.yMax = niceCeil(sorted[Math.floor(sorted.length * 0.995)] || 1);
+  const y = (v) => PLOT_T + PLOT_H - (Math.min(v, tl.yMax) / tl.yMax) * PLOT_H;
+
+  // 目盛り
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (const v of [0, tl.yMax / 2, tl.yMax]) {
+    ctx.strokeStyle = '#262b35'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD_L, Math.round(y(v)) + 0.5); ctx.lineTo(PAD_L + W, Math.round(y(v)) + 0.5); ctx.stroke();
+    ctx.fillStyle = '#6b7383'; ctx.fillText(`${fmt(v)} mm`, PAD_L - 6, y(v));
+  }
+  // 区間内の最大 (面) と平均 (線)
+  ctx.fillStyle = 'rgba(91, 157, 255, 0.22)';
+  ctx.beginPath(); ctx.moveTo(PAD_L, y(0));
+  for (let i = 0; i < cols; i++) ctx.lineTo(PAD_L + i + 0.5, y(max[i]));
+  ctx.lineTo(PAD_L + cols, y(0)); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#5b9dff'; ctx.lineWidth = 1.5; ctx.beginPath();
+  for (let i = 0; i < cols; i++) ctx[i ? 'lineTo' : 'moveTo'](PAD_L + i + 0.5, y(mean[i]));
+  ctx.stroke();
+  ctx.fillStyle = '#98a1b0'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('MPJPE', PAD_L + 6, PLOT_T);
+
+  // 接地の帯
+  STRIPS.forEach(([label, , color], q) => {
+    const sy = STRIP_T + q * (STRIP_H + STRIP_GAP);
+    ctx.fillStyle = '#1d2129'; ctx.fillRect(PAD_L, sy, W, STRIP_H);
+    ctx.fillStyle = color;
+    for (let i = 0; i < cols; i++) {
+      if (strip[q][i] <= 0) continue;
+      ctx.globalAlpha = strip[q][i];
+      ctx.fillRect(PAD_L + i, sy, 1, STRIP_H);
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#6b7383'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, PAD_L - 6, sy + STRIP_H / 2);
+  });
+  // 被験者の境界
+  for (const s of meta.subjects.slice(1)) {
+    if (s.start <= tl.v0 || s.start >= tl.v1) continue;
+    ctx.strokeStyle = '#4a5160'; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(f2x(s.start), PLOT_T); ctx.lineTo(f2x(s.start), tl.h); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  $('#rangeLabel').textContent = span < N
+    ? `表示範囲 ${fmt(tl.v0)}–${fmt(tl.v1)} (${fmt(span / FPS, 1)} s)` : '';
+}
+
+let lastOverlay = '';
+function drawOverlay() {
+  const f = Math.floor(state.cur);
+  const sig = `${f}|${tl.hover}|${tl.v0}|${tl.v1}|${tl.w}`;
+  if (sig === lastOverlay) return;
+  lastOverlay = sig;
+  const ctx = octx;
+  ctx.clearRect(0, 0, tl.w, tl.h);
+  if (f >= tl.v0 && f <= tl.v1) {
+    const x = Math.round(f2x(f)) + 0.5;
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, tl.h); ctx.stroke();
+  }
+  if (tl.hover >= 0) {
+    const h = tl.hover, x = Math.round(f2x(h)) + 0.5;
+    ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, tl.h); ctx.stroke();
+    const text = `${fmt(h)}  (${fmt(h / FPS, 2)} s)   ${fmt(S.mpjpe[h], 1)} mm`;
+    ctx.font = '11px system-ui, sans-serif';
+    const tw = ctx.measureText(text).width + 12;
+    const bx = clamp(x + 8, PAD_L, tl.w - PAD_R - tw);
+    ctx.fillStyle = 'rgba(22,25,32,.92)'; ctx.strokeStyle = '#2a2f3a';
+    ctx.fillRect(bx, 2, tw, 18); ctx.strokeRect(bx + 0.5, 2.5, tw - 1, 17);
+    ctx.fillStyle = '#e7e9ee'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, bx + 6, 11);
+  }
+}
+
+function frameAt(e) {
+  const r = overC.getBoundingClientRect();
+  return clamp(Math.round(x2f(e.clientX - r.left)), 0, N - 1);
+}
+overC.addEventListener('pointerdown', (e) => {
+  tl.dragging = true; overC.setPointerCapture(e.pointerId); seek(frameAt(e));
+});
+overC.addEventListener('pointermove', (e) => {
+  tl.hover = frameAt(e);
+  if (tl.dragging) seek(tl.hover);
+});
+overC.addEventListener('pointerup', () => { tl.dragging = false; });
+overC.addEventListener('pointerleave', () => { tl.hover = -1; });
+overC.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const r = overC.getBoundingClientRect();
+  const f = x2f(e.clientX - r.left), span = tl.v1 - tl.v0;
+  const ns = clamp(span * (e.deltaY > 0 ? 1.25 : 0.8), Math.min(200, N), N);
+  const v0 = clamp(f - ((f - tl.v0) / span) * ns, 0, N - ns);
+  tl.v0 = v0; tl.v1 = v0 + ns;
+  drawChart(); lastOverlay = '';
+}, { passive: false });
+$('#zoomReset').addEventListener('click', () => { tl.v0 = 0; tl.v1 = N; drawChart(); lastOverlay = ''; });
+
+// 再生位置が表示範囲の外に出たら範囲を送る
+function followPlayhead() {
+  const f = state.cur, span = tl.v1 - tl.v0;
+  if (span >= N || (f >= tl.v0 && f <= tl.v1)) return;
+  tl.v0 = clamp(f - span * 0.1, 0, N - span); tl.v1 = tl.v0 + span;
+  drawChart(); lastOverlay = '';
+}
+
+// ------------------------------------------------------------------
+// 全体の指標と誤差の大きい区間
+// ------------------------------------------------------------------
+{
+  let sum = 0;
+  for (let i = 0; i < N; i++) sum += S.mpjpe[i];
+  const sorted = Float32Array.from(S.mpjpe).sort();
+  const acc = (k) => {
+    let ok = 0;
+    for (let i = 0; i < N; i++) ok += (S[`pred_contact_${k}`][i] > 0.5) === (S[`gt_contact_${k}`][i] > 0.5);
+    return (ok / N) * 100;
+  };
+  let rsum = 0; for (let i = 0; i < N; i++) rsum += S.root_err[i];
+  const rows = [
+    ['フレーム数', `${fmt(N)} (${fmt(N / FPS, 1)} s)`],
+    ['MPJPE 平均', `${fmt(sum / N, 2)} mm`],
+    ['MPJPE 中央値', `${fmt(sorted[Math.floor(N / 2)], 2)} mm`],
+    ['MPJPE 95%点', `${fmt(sorted[Math.floor(N * 0.95)], 2)} mm`],
+    ['腰の高さの誤差', `${fmt(rsum / N, 2)} mm`],
+    ['接地の正解率 左 / 右', `${fmt(acc('l'), 1)} / ${fmt(acc('r'), 1)} %`],
+  ];
+  $('#summary').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd class="num">${v}</dd>`).join('');
+
+  const subj = meta.subjects;
+  $('#info').textContent = `${meta.source} · ` + subj.map((s) => `${s.name} (${s.gender})`).join(', ') +
+    ` · ${fmt(FPS)} Hz · ${meta.device}`;
+  $('#info').title = subj.map((s) => `${s.name}: β = [${s.betas.join(', ')}]`).join('\n');
+
+  // 2 秒以上離れたピークを MPJPE の大きい順に
+  const order = Array.from({ length: N }, (_, i) => i).sort((a, b) => S.mpjpe[b] - S.mpjpe[a]);
+  const picked = [], gap = 2 * FPS;
+  for (const f of order) {
+    if (picked.every((p) => Math.abs(p - f) > gap)) picked.push(f);
+    if (picked.length >= 8) break;
+  }
+  const list = $('#worstList');
+  list.innerHTML = picked.map((f) =>
+    `<button data-f="${f}"><span class="num">${fmt(f)} <span style="color:var(--faint)">(${fmt(f / FPS, 2)} s)</span></span>` +
+    `<span class="v num">${fmt(S.mpjpe[f], 1)} mm</span></button>`).join('');
+  list.addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    setPlaying(false); seek(Number(b.dataset.f));
+  });
+}
+
+// ------------------------------------------------------------------
+// メインループ
+// ------------------------------------------------------------------
+function resize() {
+  const r = view.getBoundingClientRect();
+  renderer.setSize(r.width, r.height, false);
+  camera.aspect = r.width / Math.max(1, r.height);
+  camera.updateProjectionMatrix();
+  resizeChart();
+}
+new ResizeObserver(resize).observe(view);
+new ResizeObserver(resizeChart).observe($('#chartWrap'));
+
+const labelVec = new THREE.Vector3(), sideVec = new THREE.Vector3();
+function placeLabel(el, body) {
+  if (state.layout !== 'side') { el.style.display = 'none'; return; }
+  labelVec.copy(body.group.position).setY(2.0).project(camera);
+  const r = view.getBoundingClientRect();
+  el.style.display = labelVec.z < 1 ? 'block' : 'none';
+  el.style.left = `${(labelVec.x * 0.5 + 0.5) * r.width}px`;
+  el.style.top = `${(-labelVec.y * 0.5 + 0.5) * r.height}px`;
+}
+
+// 右ドラッグの平行移動で注視点が遠くへ行くと、同じく far を超えて消えるため範囲内に留める
+// (人は原点付近にいる。カメラも一緒に動かして見え方を保つ)
+const clampedTarget = new THREE.Vector3();
+function clampTarget() {
+  const t = controls.target;
+  clampedTarget.set(clamp(t.x, -4, 4), clamp(t.y, -0.5, 2.5), clamp(t.z, -4, 4));
+  if (clampedTarget.equals(t)) return;
+  camera.position.add(clampedTarget).sub(t);
+  t.copy(clampedTarget);
+}
+
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (state.playing) {
+    let next = state.cur + dt * FPS * state.speed;
+    if (next > N - 1) {
+      if (state.loop) next = 0; else { next = N - 1; setPlaying(false); }
+    }
+    if (hasFrame(Math.floor(next))) state.cur = next;   // まだ届いていなければ待つ
+    followPlayhead();
+  }
+  const f = Math.floor(state.cur);
+  ensureChunks(f);
+  if (f !== state.shown) showFrame(f);
+  if (camPending && state.shown >= 0) { const c = camPending; camPending = null; setCam(c); }
+  if (state.layout === 'side') {
+    // カメラから見て左に予測, 右に正解を並べる
+    camera.getWorldDirection(sideVec).setY(0);
+    if (sideVec.lengthSq() < 1e-6) sideVec.set(0, 0, -1);
+    sideVec.normalize().set(-sideVec.z, 0, sideVec.x).multiplyScalar(0.45);   // 画面の右方向
+    pred.group.position.copy(sideVec).negate();
+    gt.group.position.copy(sideVec);
+  }
+  $('#buffering').classList.toggle('on', f !== state.shown);
+  if (state.shown >= 0) $('#loading').style.display = 'none';
+
+  clampTarget();
+  controls.update();
+  renderer.render(scene, camera);
+  placeLabel($('#labelPred'), pred);
+  placeLabel($('#labelGt'), gt);
+  drawOverlay();
+  requestAnimationFrame(tick);
+}
+resize();
+requestAnimationFrame(tick);
+
+// ブラウザの開発者ツールや自動テストから操作するためのハンドル
+window.meshViewer = { THREE, camera, controls, state, seek, pred, gt, meta };
+</script>
+</body>
+</html>
