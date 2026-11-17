@@ -3,8 +3,12 @@
 入力の正規化・出力の逆正規化には学習時に保存した統計量 (stats.json) を使う。
 
 使い方:
-    uv run test.py [--config config.yaml]
+    uv run test.py [--config config.yaml] [--ids D2S1T1 ...]
     uv run evaluate.py      # 続けて評価指標を計算
+
+テストに使う収録は ID で指定できる (ワイルドカード可)。
+優先順位: --ids > config.yaml の dataset.test_ids > data/sensor/test/ にある収録すべて
+学習に使った収録 (checkpoints/data_ids.json) と重なる場合は警告を出す。
 
 入力:
     outputs/checkpoints/model.pth, outputs/checkpoints/stats.json
@@ -32,12 +36,12 @@ import torch
 from dataset import get_dataloader
 from models import KinematicFusionSystem
 from utils.export_csv import export_predictions_to_csv, export_rotations_to_csv, export_contacts_to_csv
-from utils.paths import load_config, get_paths, DEFAULT_CONFIG
+from utils.paths import load_config, get_paths, resolve_ids, DEFAULT_CONFIG
 from utils.rotation import rot6d_to_matrix, matrix_to_axis_angle
 from utils.smpl import SMPLBank, PARENTS
 
 
-def test(config_path=DEFAULT_CONFIG):
+def test(config_path=DEFAULT_CONFIG, ids=None):
     config = load_config(config_path)
     paths = get_paths(config, makedirs=True)
 
@@ -64,10 +68,19 @@ def test(config_path=DEFAULT_CONFIG):
         sync_cfg=config.get('sync'),
         target=target,
         smpl_cfg=config.get('smpl'),
+        calib_cfg=config.get('calibration'),
+        contact_source=ds_cfg.get('contact_source', 'pressure'),
+        canonical_heading=ds_cfg.get('canonical_heading', True),
+        floor_normalize=ds_cfg.get('floor_normalize', True),
+        ids=resolve_ids(config, 'test', ids),
     )
+    check_overlap(paths, dataloader.dataset.data_ids)
     with open(paths.sync_test, 'w', encoding='utf-8') as f:
         json.dump(dataloader.dataset.sync_info, f, indent=2, ensure_ascii=False)
     print(f"[test] 同期結果を {paths.sync_test} に保存しました")
+    with open(paths.calib_test, 'w', encoding='utf-8') as f:
+        json.dump(dataloader.dataset.calib_info, f, indent=2, ensure_ascii=False, default=float)
+    print(f"[test] キャリブレーション結果を {paths.calib_test} に保存しました")
 
     if target == 'smpl':
         return test_smpl(config, paths, model, dataloader, device)
@@ -105,6 +118,20 @@ def test(config_path=DEFAULT_CONFIG):
     export_predictions_to_csv(all_pred_pos, all_gt_pos, paths.pred_pos)
     export_rotations_to_csv(all_pred_rot, all_gt_rot, paths.pred_rot)
     export_contacts_to_csv(all_pred_contact, all_gt_contact, paths.pred_contact)
+
+
+def check_overlap(paths, test_ids):
+    """学習に使った収録とテストの収録が重なっていれば警告する (重なると評価が甘くなる)。"""
+    print(f"[test] テストに使う収録 ID: {test_ids}")
+    if not paths.data_ids.exists():
+        print(f"[test] 注意: {paths.data_ids} が無いため、学習データとの重複は確認できません")
+        return
+    with open(paths.data_ids, encoding='utf-8') as f:
+        train_ids = json.load(f).get('train', [])
+    overlap = sorted(set(train_ids) & set(test_ids))
+    if overlap:
+        print(f"[test] 警告: 学習にも使った収録がテストに含まれています: {overlap} "
+              f"(学習に使った収録: {train_ids})")
 
 
 def test_smpl(config, paths, model, dataloader, device):
@@ -179,5 +206,7 @@ def test_smpl(config, paths, model, dataloader, device):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default=DEFAULT_CONFIG)
+    parser.add_argument('--ids', nargs='+', default=None,
+                        help='テストに使う収録 ID (ワイルドカード可)。config の dataset.test_ids より優先')
     args = parser.parse_args()
-    test(args.config)
+    test(args.config, args.ids)

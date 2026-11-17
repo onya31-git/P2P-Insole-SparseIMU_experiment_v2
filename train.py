@@ -2,7 +2,10 @@
 モデルを学習する。
 
 使い方:
-    uv run train.py [--config config.yaml]
+    uv run train.py [--config config.yaml] [--ids D2S1A1 D2S1A2 ...]
+
+学習に使う収録は ID で指定できる (ワイルドカード可, 例 --ids "D2S1A*")。
+優先順位: --ids > config.yaml の dataset.train_ids > data/sensor/train/ にある収録すべて
 
 config.yaml の dataset.target で正解の形式を切り替える:
     skeleton : mocap の 18 関節の位置・回転を直接推定 (PoseLoss)
@@ -12,11 +15,14 @@ config.yaml の dataset.target で正解の形式を切り替える:
 出力:
     outputs/checkpoints/model.pth   学習済み重み (エポックごとに上書き保存)
     outputs/checkpoints/stats.json  正規化統計量 (test.py で使用)
+    outputs/checkpoints/data_ids.json 学習に使った収録 ID (test.py がテストとの重複を確認する)
     outputs/sync/train.json         学習データの時刻同期結果
 """
 import json
+import random
 import argparse
 
+import numpy as np
 import torch
 
 from dataset import get_dataloader
@@ -25,7 +31,7 @@ from losses.pose_loss import PoseLoss
 from losses.cycle_loss import CycleLoss
 from losses.smpl_loss import SMPLPoseLoss
 from models import KinematicFusionSystem
-from utils.paths import load_config, get_paths, DEFAULT_CONFIG
+from utils.paths import load_config, get_paths, resolve_ids, DEFAULT_CONFIG
 from utils.smpl import SMPLBank
 
 
@@ -37,13 +43,21 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 
-def train(config_path=DEFAULT_CONFIG):
+def train(config_path=DEFAULT_CONFIG, ids=None):
     config = load_config(config_path)
     paths = get_paths(config, makedirs=True)
 
     ds_cfg = config.get('dataset', {})
     tr_cfg = config.get('training', {})
     cy_cfg = config.get('cycle_loss', {})
+
+    seed = tr_cfg.get('seed')
+    if seed is not None:
+        # 比較実験用。GPU の演算 (cuDNN の GRU など) は完全には再現しない
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        print(f"[train] 乱数シード: {seed}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     target = ds_cfg.get('target', 'skeleton')
@@ -71,11 +85,22 @@ def train(config_path=DEFAULT_CONFIG):
         sync_cfg=config.get('sync'),
         target=target,
         smpl_cfg=config.get('smpl'),
+        calib_cfg=config.get('calibration'),
+        contact_source=ds_cfg.get('contact_source', 'pressure'),
+        canonical_heading=ds_cfg.get('canonical_heading', True),
+        floor_normalize=ds_cfg.get('floor_normalize', True),
+        ids=resolve_ids(config, 'train', ids),
     )
 
+    with open(paths.data_ids, 'w', encoding='utf-8') as f:
+        json.dump({'train': dataloader.dataset.data_ids}, f, indent=2)
+    print(f"[train] 学習に使った収録 ID を {paths.data_ids} に保存しました: {dataloader.dataset.data_ids}")
     with open(paths.sync_train, 'w', encoding='utf-8') as f:
         json.dump(dataloader.dataset.sync_info, f, indent=2, ensure_ascii=False)
     print(f"[train] 同期結果を {paths.sync_train} に保存しました")
+    with open(paths.calib_train, 'w', encoding='utf-8') as f:
+        json.dump(dataloader.dataset.calib_info, f, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+    print(f"[train] キャリブレーション結果を {paths.calib_train} に保存しました")
     with open(paths.stats, 'w') as f:
         json.dump(dataloader.dataset.id_stats, f, cls=NumpyEncoder)
     print(f"[train] 統計量を {paths.stats} に保存しました (keys: {list(dataloader.dataset.id_stats.keys())})")
@@ -126,5 +151,7 @@ def train(config_path=DEFAULT_CONFIG):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default=DEFAULT_CONFIG)
+    parser.add_argument('--ids', nargs='+', default=None,
+                        help='学習に使う収録 ID (ワイルドカード可)。config の dataset.train_ids より優先')
     args = parser.parse_args()
-    train(args.config)
+    train(args.config, args.ids)

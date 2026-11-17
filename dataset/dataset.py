@@ -7,6 +7,11 @@
     {smpl_dir}/{train,test}/D1S1A1_smpl.npz            ... SMPL パラメータ (target='smpl' のとき。
                                                            scripts/fit_smpl.py で BVH から作成)
 
+使う収録の選び方:
+    ids を指定しない : mode と同じ名前のフォルダ ({train,test}/) にある収録をすべて使う
+    ids を指定する   : train/ と test/ のどちらにあっても、ID が一致する収録を使う
+                       (例 ['D2S1A1', 'D2S1A2'] / ワイルドカード可 ['D2S1A*', 'D1*'])
+
 ファイル命名規則 (詳細は data/README.md):
     D: Data collection Number, S: Subject Number,
     A: Action Section Number (A0 はキャリブレーション), T: Test 用データ
@@ -20,21 +25,29 @@
     - timestamp_ms は全センサー共通のエポックミリ秒
 
 時刻同期:
-    センサー5台は共通時計で互いに同期しているが、mocap (スケルトン) との
-    オフセットは収録ごとに 0.4〜1.8 秒程度ばらつく。そこで収録ごとに
-    「センサーの角速度ノルム」と「対応する関節の速度」の相互相関から
-    オフセットを1つ推定し、センサー側をずらしてスケルトンに合わせる
-    (estimate_sync_offset)。センサー範囲外となるフレームは切り捨てる。
+    mocap (スケルトン) とセンサーのオフセットは収録ごとに 0.4〜1.8 秒程度ばらつく。そこで収録ごとに
+    「センサーの角速度ノルム」と「対応する関節の速度」の相互相関からオフセットを推定し、
+    センサー側をずらしてスケルトンに合わせる。センサー範囲外となるフレームは切り捨てる。
+    センサーの時計はデバイスの種類ごとにずれることがある (D2 ではインソール FL / FR だけ約 0.5 秒ずれていた) ため、
+    同じ時計のセンサーのまとまり (config の sync.groups) ごとにオフセットを推定し、
+    まとまり間の差はセンサー時刻の補正 (clock_shift_sec) として先に取り除く。
 
 正解の形式 (target):
     'skeleton' : mocap の 18 関節の位置 (正規化済み) と回転 (従来の方式)
     'smpl'     : 上に加えて SMPL の姿勢 (6D 回転)・並進・関節位置。SMPL の npz は BVH と同じ
                  フレーム (= スケルトン CSV の行) に対応するので、CSV と同じフレームを切り出す。
     いずれの場合も body_params には被験者の β (config の smpl.subjects) を入れる (無ければ 0)。
+
+キャリブレーション (config の calibration。詳細は dataset/calibration.py):
+    - 机置きデータ (sensor/calib/D?S?A0_*.csv) → ジャイロのバイアスと圧力のゼロ点を引く
+    - 収録の最初 / 最後の T ポーズ → IMU の取り付け向き (重力に対する傾き) の補正と、
+      圧力を T ポーズ時の合計 (体重) で割る体重基準化
+    結果は outputs/calib/{train,test}.json に保存される。
 """
 import os
 import re
 import glob
+import fnmatch
 from itertools import islice
 
 import numpy as np
@@ -42,6 +55,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+from dataset import calibration as calib
 from utils.rotation import axis_angle_to_matrix, matrix_to_rot6d
 from utils.smpl import NUM_BETAS
 
@@ -85,7 +99,12 @@ MOCAP_TO_SMPL = {
     10: 1, 11: 4, 12: 7, 13: 10, 14: 2, 15: 5, 16: 8, 17: 11,
 }
 
-# 接地ラベル (compute_foot_contact) の判定に使う関節と閾値
+# 接地ラベル (compute_pressure_contact) の閾値: 圧力の合計が p1 + 比率 x (p95 - p1) を超えたら接地
+#   D1 では mocap による判定 (compute_foot_contact) と κ 0.82〜0.83 で一致する。D2 のように mocap の
+#   高さがドリフトしたり体の位置がその場に固定されていたり (歩行で立脚中の足が後ろへ動く) しても使える
+CONTACT_PRESS_FRAC = 0.1
+
+# 接地ラベル (compute_foot_contact。contact_source = 'mocap' のとき) の判定に使う関節と閾値
 FOOT_JOINTS = [("LAnklePositions", "LToePositions"), ("RAnklePositions", "RToePositions")]
 # 閾値はインソール圧力の合計 (足裏の物理的な接地) との一致度が最も高くなるように決めた
 # (一致率 91〜94%, Cohen's κ 0.70〜0.79; 高さは 15 mm が最良, 速さは 300 mm/s 以上でほぼ横ばい)
@@ -95,6 +114,8 @@ CONTACT_SPEED_THRESH = 400.0   # 速さ [mm/s]
 # 同期推定に使う (センサー部位, スケルトン関節インデックス) の対応
 #   JOINT_NAMES の順序: 0 CoG, 6 LWrist, 9 RWrist, 12 LAnkle, 16 RAnkle
 SYNC_PAIRS = [('AL', 6), ('AR', 9), ('FL', 12), ('FR', 16), ('BC', 0)]
+# 同じ時計を共有するセンサーのまとまり (config の sync.groups の既定値): 腕・背中の IMU / インソール
+DEFAULT_SYNC_GROUPS = [['AL', 'AR', 'BC'], ['FL', 'FR']]
 
 
 def subject_key(data_id):
@@ -121,6 +142,68 @@ def _hinge_to_quat(included_angle):
     q[:, 0] = np.cos(theta / 2)
     q[:, 1] = np.sin(theta / 2)
     return q
+
+
+def rot_y(theta):
+    """鉛直軸 (y) まわりに theta [rad] 回す回転行列 (z 軸を x 軸の方へ回す)。"""
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+# 床の高さの推定 (estimate_floor) に使う関節と窓
+FLOOR_JOINTS = ['LToePositions', 'RToePositions', 'LAnklePositions', 'RAnklePositions']
+FLOOR_WIN_SEC = 10.0
+
+
+def estimate_floor(pos, contact, win_sec=FLOOR_WIN_SEC, step=50, min_count=20):
+    """
+    mocap の床の高さ [mm] をフレームごとに推定する。
+
+    どちらかの足が接地しているフレームの「足首・つま先のうち最も低い関節の高さ」の、前後 win_sec / 2 秒の中央値。
+    mocap の床の高さは収録ごとに違い (D2 では約 50 mm), 収録中にもドリフトするため、
+    この値を引いて「接地中のつま先の関節の高さ ≒ 0」にそろえる (関節の中心の高さなので床そのものではない)。
+
+    Parameters
+    ----------
+    pos : [T, J, 3]  関節位置 [mm] (y が鉛直)
+    contact : [T, 2]  接地ラベル
+    戻り値 : [T] または None (接地フレームが足りないとき)
+    """
+    low = pos[:, [JOINT_NAMES.index(j) for j in FLOOR_JOINTS], 1].min(axis=1)
+    on = contact.max(axis=1) > 0
+    T, half = len(pos), int(win_sec * SKEL_FPS / 2)
+    centers = np.arange(0, T, step)
+    vals = np.full(len(centers), np.nan)
+    for k, i in enumerate(centers):
+        sl = slice(max(0, i - half), i + half)
+        x = low[sl][on[sl]]
+        if len(x) >= min_count:
+            vals[k] = np.median(x)
+    ok = ~np.isnan(vals)
+    if not ok.any():
+        return None
+    return np.interp(np.arange(T), centers[ok], vals[ok])
+
+
+def compute_pressure_contact(press_l, press_r, frac=CONTACT_PRESS_FRAC):
+    """
+    インソール圧力の合計から接地ラベルを作る。
+
+    足を上げてもインソールには靴の締め付けなどで一定の荷重が残るため、ゼロではなく
+    収録中の圧力の合計の 1 パーセンタイル (足を上げたとき) を基準にし、95 パーセンタイル
+    (荷重時) との間の frac の位置を閾値とする。
+
+    Parameters
+    ----------
+    press_l, press_r : [T, 112]  時刻を合わせた左右の圧力 (正規化する前)
+    戻り値 : [T, 2]  左足, 右足 (float, 0 or 1)
+    """
+    contact = np.zeros((len(press_l), 2))
+    for side, p in enumerate((press_l, press_r)):
+        s = p.sum(axis=1)
+        lo, hi = np.percentile(s, 1), np.percentile(s, 95)
+        contact[:, side] = s > lo + frac * (hi - lo)
+    return contact
 
 
 def compute_foot_contact(pos, height_margin=CONTACT_HEIGHT_MARGIN, speed_thresh=CONTACT_SPEED_THRESH):
@@ -166,9 +249,9 @@ def _xcorr_curve(a, b, max_lag):
     return lags, vals
 
 
-def estimate_sync_offset(skel_t, skel_pos, sensor_t, sensor_gyro, max_lag_sec=5.0, smooth_sec=0.2):
+def sync_curves(skel_t, skel_pos, sensor_t, sensor_gyro, max_lag_sec=5.0, smooth_sec=0.2):
     """
-    センサーとスケルトンの時刻オフセット (秒) を推定する。
+    センサーごとに「角速度ノルム」と「対応する関節の速度」の相互相関をラグの関数として求める。
 
     Parameters
     ----------
@@ -176,29 +259,40 @@ def estimate_sync_offset(skel_t, skel_pos, sensor_t, sensor_gyro, max_lag_sec=5.
     skel_pos : [T, J, 3]  スケルトンのグローバル関節位置 (ルート相対化する前)
     sensor_t : {part: [N] 秒}  共通原点からのセンサー時刻
     sensor_gyro : {part: [N, 3]}  ジャイロ
-    戻り値 : (offset_sec, peak_r, {part: (offset_sec, peak_r)})
-        スケルトン時刻 t に対応するセンサー時刻は t + offset_sec。
+    戻り値 : (lags_sec [L], {part: r [L]})
+        ラグ L の相関はスケルトン時刻 t とセンサー時刻 t + L の対応の良さ。
     """
-    t_grid = skel_t
     win = max(1, int(round(smooth_sec * SKEL_FPS)))
     max_lag = int(round(max_lag_sec * SKEL_FPS))
-
-    curves, per_part = [], {}
+    lags, curves = np.arange(-max_lag, max_lag + 1), {}
     for part, j in SYNC_PAIRS:
         if part not in sensor_t:
             continue
         vel = np.gradient(skel_pos[:, j, :], axis=0) * SKEL_FPS
         a = _zscore(_smooth(np.linalg.norm(vel, axis=1), win))
         gyro = np.linalg.norm(sensor_gyro[part], axis=1)
-        b = _zscore(_smooth(np.interp(t_grid, sensor_t[part], gyro), win))
-        lags, r = _xcorr_curve(a, b, max_lag)
-        curves.append(r)
-        k = int(np.argmax(r))
-        per_part[part] = (lags[k] / SKEL_FPS, float(r[k]))
+        b = _zscore(_smooth(np.interp(skel_t, sensor_t[part], gyro), win))
+        lags, curves[part] = _xcorr_curve(a, b, max_lag)
+    return lags / SKEL_FPS, curves
 
-    mean_r = np.mean(curves, axis=0)
-    k = int(np.argmax(mean_r))
-    return lags[k] / SKEL_FPS, float(mean_r[k]), per_part
+
+def _peak(lags_sec, curves):
+    """複数センサーの相関の平均が最大になるラグ (秒) と、その相関。"""
+    r = np.mean(curves, axis=0)
+    k = int(np.argmax(r))
+    return float(lags_sec[k]), float(r[k])
+
+
+def estimate_sync_offset(skel_t, skel_pos, sensor_t, sensor_gyro, max_lag_sec=5.0, smooth_sec=0.2):
+    """
+    センサーとスケルトンの時刻オフセット (秒) を全センサー共通の 1 つの値として推定する。
+    戻り値 : (offset_sec, peak_r, {part: (offset_sec, peak_r)})
+        スケルトン時刻 t に対応するセンサー時刻は t + offset_sec。
+    """
+    lags, curves = sync_curves(skel_t, skel_pos, sensor_t, sensor_gyro, max_lag_sec, smooth_sec)
+    per_part = {p: _peak(lags, [c]) for p, c in curves.items()}
+    offset, r = _peak(lags, list(curves.values()))
+    return offset, r, per_part
 
 
 class InsoleIMUDataset(Dataset):
@@ -208,7 +302,8 @@ class InsoleIMUDataset(Dataset):
         imu_data                       : [T, 5, 6]  順序: AL, AR, FL, FR, BC
         gt_joint_pos                   : [T, 18, 3]
         gt_joint_rot                   : [T, 18, 6] (先頭4次元が関節の相対回転 W,X,Y,Z, 残り2次元は0)
-        gt_contact                     : [T, 2]     左足, 右足の接地 (1=接地, compute_foot_contact)
+        gt_contact                     : [T, 2]     左足, 右足の接地 (1=接地。contact_source に応じて
+                                                compute_pressure_contact / compute_foot_contact)
         body_params                    : [10]       被験者の体型 β (config の smpl.subjects。無ければ 0)
         data_id                        : 正規化に使った被験者キー (例: 'D1S1')
         pos_mean / pos_std             : [18, 3]    位置の正規化統計量 (pos_mm = pos * pos_std + pos_mean)
@@ -226,14 +321,29 @@ class InsoleIMUDataset(Dataset):
     """
 
     def __init__(self, data_path, seq_len=64, mode='train', stats=None,
-                 exclude_calibration=True, sync_cfg=None, target='skeleton', smpl_cfg=None):
+                 exclude_calibration=True, sync_cfg=None, target='skeleton', smpl_cfg=None,
+                 calib_cfg=None, ids=None, contact_source='pressure', canonical_heading=True,
+                 floor_normalize=True):
         """
         Parameters
         ----------
         data_path : str
             sensor/ と skeleton/ を含むデータディレクトリ。
         mode : 'train' or 'test'
-            読み込むサブディレクトリ名。
+            学習かテストか (シャッフルの有無・T ポーズの確認方法が変わる)。
+            ids を指定しない場合は、読み込むサブディレクトリ名も兼ねる。
+        contact_source : 'pressure' or 'mocap'
+            接地ラベルの作り方。pressure: インソール圧力の合計 (compute_pressure_contact) /
+            mocap: 足の高さと速さ (compute_foot_contact。mocap の高さのドリフトや、体の位置が固定された歩行に弱い)
+        canonical_heading : bool
+            target='smpl' のとき、収録ごとに骨盤の平均の向きが +z になるよう正解 (SMPL・mocap の関節位置) を
+            鉛直軸まわりに回す (回した角度は heading_info に入る)
+        floor_normalize : bool
+            target='smpl' のとき、接地中の足の高さから床の高さを推定し (estimate_floor)、正解の高さ
+            (SMPL の並進・関節, mocap の関節位置) から引く。mocap の床の高さは収録ごとに違い、収録中にもドリフトするため
+        ids : list of str, str or None
+            使う収録の ID (ワイルドカード可)。指定すると train/ と test/ のどちらのフォルダに
+            あるかに関係なく ID で探す。None なら mode のフォルダの収録をすべて使う。
         stats : dict or None
             {subject_key: {pos_mean, pos_std, lp_mean, ...}}。
             None の場合はこのデータから計算する。
@@ -249,13 +359,20 @@ class InsoleIMUDataset(Dataset):
             正解の形式 (モジュールの docstring 参照)。
         smpl_cfg : dict or None
             config.yaml の smpl セクション (data_dir, subjects)。
+        calib_cfg : dict or None
+            config.yaml の calibration セクション (dataset/calibration.py の DEFAULTS を参照)。
+            None なら既定値 (有効)。テスト時は学習時 (stats) と同じ設定である必要がある。
         """
         if target not in ('skeleton', 'smpl'):
             raise ValueError(f"target は 'skeleton' か 'smpl' です: {target}")
         self.target = target
         smpl_cfg = smpl_cfg or {}
         from utils.paths import resolve
-        self.smpl_dir = os.path.join(str(resolve(smpl_cfg.get('data_dir', 'data/smpl'))), mode)
+        self.smpl_root = str(resolve(smpl_cfg.get('data_dir', 'data/smpl')))
+        if isinstance(ids, str):
+            ids = [ids]
+        self.ids = [str(i).upper() for i in ids] if ids else None
+        self.data_ids = []   # 実際に使った収録の ID (_load_and_align_data で設定)
         self.subjects = {k.upper(): v for k, v in (smpl_cfg.get('subjects') or {}).items()}
         # 被験者ごとの SMPL の情報 {subject_key: {gender, betas, offsets, offset_mask}} (評価で使う)
         self.smpl_info = {}
@@ -264,11 +381,28 @@ class InsoleIMUDataset(Dataset):
         self.sync_max_lag = float(sync_cfg.get('max_lag_sec', 5.0))
         self.sync_min_corr = float(sync_cfg.get('min_corr', 0.3))
         self.sync_manual = {k.upper(): float(v) for k, v in (sync_cfg.get('offsets') or {}).items()}
+        # 同じ時計を共有するセンサーのまとまり (先頭のまとまりのオフセットが基準)
+        groups = sync_cfg.get('groups') or DEFAULT_SYNC_GROUPS
+        self.sync_groups = [[str(p).upper() for p in g] for g in groups]
+        listed = sorted(p for g in self.sync_groups for p in g)
+        if listed != sorted(p for p, _ in SYNC_PAIRS):
+            raise ValueError(f"config の sync.groups には AL, AR, BC, FL, FR を 1 回ずつ書いてください: {groups}")
         # 収録ごとの同期結果 {data_id: {offset_sec, source, peak_r, per_sensor, frames_kept}}
         self.sync_info = {}
         self.mode = mode
-        self.input_dir = os.path.join(data_path, 'sensor', mode)
-        self.skeleton_dir = os.path.join(data_path, 'skeleton', mode)
+        self.data_path = data_path
+        self.calib = calib.merge_config(calib_cfg)
+        # 収録ごとのキャリブレーション結果 (JSON に保存する) / 被験者キーごとの A0 の値 / 統計量に加える値
+        self.calib_info = {}
+        self._a0_cache = {}
+        self._calib_stats = {}
+        if contact_source not in ('pressure', 'mocap'):
+            raise ValueError(f"contact_source は 'pressure' か 'mocap' です: {contact_source}")
+        self.contact_source = contact_source
+        self.canonical_heading = bool(canonical_heading) and target == 'smpl'
+        self.heading_info = {}   # 収録ごとに回した向き [rad] (canonical_heading)
+        self.floor_normalize = bool(floor_normalize) and target == 'smpl'
+        self.floor_info = {}     # 収録ごとの床の高さ [mm] {p5, p50, p95} (floor_normalize)
         self.seq_len = seq_len
         self.exclude_calibration = exclude_calibration
 
@@ -281,12 +415,26 @@ class InsoleIMUDataset(Dataset):
                                  for kk, vv in st.items()}
                              for k, st in stats.items()}
         self._stats_given = stats is not None
+        if self._stats_given and self.id_stats:
+            trained = next(iter(self.id_stats.values())).get('calib_flags', 'disabled')
+            current = calib.config_flags(self.calib)
+            if trained != current:
+                raise ValueError(
+                    f"キャリブレーションの設定が学習時と異なります (学習時: {trained} / 現在: {current})。"
+                    f"config.yaml の calibration を学習時と同じにするか、再学習してください")
+            first = next(iter(self.id_stats.values()))
+            for name, label in (('canonical_heading', '向きの正規化'), ('floor_normalize', '床の高さの補正')):
+                trained, current = bool(first.get(name, False)), getattr(self, name)
+                if trained != current:
+                    raise ValueError(
+                        f"{label} (config の dataset.{name}) が学習時と異なります "
+                        f"(学習時: {trained} / 現在: {current})。設定を学習時と同じにするか、再学習してください")
 
         self.data_seqs = self._load_and_align_data()
         self.num_samples = len(self.data_seqs)
         if self.num_samples == 0:
-            raise RuntimeError(
-                f"[Dataset] 有効なシーケンスがありません: {self.skeleton_dir}, {self.input_dir}")
+            where = f"ID {self.ids}" if self.ids else f"sensor/{mode}, skeleton/{mode}"
+            raise RuntimeError(f"[Dataset] 有効なシーケンスがありません ({where})")
 
     # ------------------------------------------------------------------
     # スケルトンCSVの解析
@@ -381,25 +529,64 @@ class InsoleIMUDataset(Dataset):
             press = df[p_cols].apply(pd.to_numeric, errors='coerce').fillna(0).to_numpy(np.float64)
         return t_ms, imu, press
 
+    def _search_dirs(self, root):
+        """
+        収録を探すフォルダの一覧。ids 未指定なら root/<mode>、
+        指定ありなら root の下のすべてのサブフォルダ (train, test など。机置きデータの calib は除く)。
+        """
+        if self.ids is None:
+            return [os.path.join(root, self.mode)]
+        return sorted(d for d in glob.glob(os.path.join(root, '*'))
+                      if os.path.isdir(d) and os.path.basename(d) != 'calib')
+
+    @staticmethod
+    def _check_unique(found, key, path):
+        if key in found and os.path.normpath(found[key]) != os.path.normpath(path):
+            raise ValueError(f"同じ収録のファイルが複数のフォルダにあります: {found[key]} / {path}")
+
     def _find_sensor_files(self):
         """{data_id: {part: path}} を返す。"""
         files = {}
-        for path in glob.glob(os.path.join(self.input_dir, '*.csv')):
-            m = SENSOR_RE.match(os.path.basename(path))
-            if not m:
-                continue
-            data_id, part = m.group(1).upper(), m.group(2).upper()
-            files.setdefault(data_id, {})[part] = path
+        for d in self._search_dirs(os.path.join(self.data_path, 'sensor')):
+            for path in glob.glob(os.path.join(d, '*.csv')):
+                m = SENSOR_RE.match(os.path.basename(path))
+                if not m:
+                    continue
+                data_id, part = m.group(1).upper(), m.group(2).upper()
+                self._check_unique(files.setdefault(data_id, {}), part, path)
+                files[data_id][part] = path
         return files
 
     def _find_skeleton_files(self):
-        """{data_id: path} を返す。"""
+        """{data_id: path} を返す。ids 指定時は一致する収録だけに絞る。"""
         files = {}
-        for path in glob.glob(os.path.join(self.skeleton_dir, '*.csv')):
-            m = SKELETON_RE.match(os.path.basename(path))
-            if m:
-                files[m.group(1).upper()] = path
-        return files
+        for d in self._search_dirs(os.path.join(self.data_path, 'skeleton')):
+            for path in glob.glob(os.path.join(d, '*.csv')):
+                m = SKELETON_RE.match(os.path.basename(path))
+                if m:
+                    self._check_unique(files, m.group(1).upper(), path)
+                    files[m.group(1).upper()] = path
+        if self.ids is None:
+            return files
+
+        available = sorted(files)
+        selected = set()
+        for pat in self.ids:
+            hit = [i for i in available if fnmatch.fnmatchcase(i, pat)]
+            if not hit:
+                raise ValueError(f"ID '{pat}' に一致する収録 (スケルトン CSV) がありません。"
+                                 f"使える ID: {', '.join(available)}")
+            selected.update(hit)
+        return {i: files[i] for i in sorted(selected)}
+
+    def _smpl_path(self, data_id):
+        """SMPL の npz のパス (ids 指定時は train / test のどちらのフォルダにあっても探す)。"""
+        if self.ids is None:
+            return os.path.join(self.smpl_root, self.mode, f'{data_id}_smpl.npz')
+        hits = glob.glob(os.path.join(self.smpl_root, '*', f'{data_id}_smpl.npz'))
+        if len(hits) > 1:
+            raise ValueError(f"同じ収録の SMPL ファイルが複数のフォルダにあります: {hits}")
+        return hits[0] if hits else os.path.join(self.smpl_root, '*', f'{data_id}_smpl.npz')
 
     # ------------------------------------------------------------------
     # 読み込み・時刻合わせ
@@ -408,8 +595,9 @@ class InsoleIMUDataset(Dataset):
         skel_files = self._find_skeleton_files()
         sensor_files = self._find_sensor_files()
         if not skel_files:
-            print(f"[Dataset] スケルトンCSVが見つかりません: {self.skeleton_dir}")
+            print(f"[Dataset] スケルトンCSVが見つかりません: {os.path.join(self.data_path, 'skeleton', self.mode)}")
             return []
+        print(f"[Dataset] {self.mode} に使う収録: {', '.join(sorted(skel_files))}")
 
         def interp_feat(t_target, t_src, feat_src):
             res = np.zeros((len(t_target), feat_src.shape[1]))
@@ -450,6 +638,10 @@ class InsoleIMUDataset(Dataset):
             for part in ('FL', 'FR'):
                 raw[part] = self._read_sensor_csv(parts[part], with_pressure=True)
 
+            # 机置きデータ (A0) のジャイロのバイアスと圧力のゼロ点を引く
+            if self.calib['enabled']:
+                self._apply_static_calib(data_id, key, raw)
+
             # 全センサー共通のエポック時計なので、最も早い開始時刻を共通原点にする
             t0 = min(r[0][0] for r in raw.values())
             sens_t = {part: (r[0] - t0) / 1000.0 for part, r in raw.items()}
@@ -458,6 +650,12 @@ class InsoleIMUDataset(Dataset):
             offset, info = self._resolve_sync_offset(
                 data_id, skel_t, pos, sens_t,
                 {part: r[1][:, 0:3] for part, r in raw.items()})  # IMU_COLS の先頭3列 = Gyro
+            # センサーのまとまり間の時計のずれを補正 (以降は全センサー共通の offset で対応する)
+            sens_t = {part: t - info['clock_shift_sec'].get(part, 0.0) for part, t in sens_t.items()}
+
+            # T ポーズの候補 (収録の最初 / 最後の静止区間)。採否と補正は全収録を読んだ後に行う
+            tpose = (self._tpose_candidates(sens_t, raw, skel_t, pos, offset)
+                     if self.calib['enabled'] else None)
 
             # ずらした結果センサーの記録範囲外になるフレームは補間できないので切り捨てる
             tq = skel_t + offset
@@ -487,8 +685,27 @@ class InsoleIMUDataset(Dataset):
             press_fl = aligned['FL'][1]                                  # [T, 112]
             press_fr = aligned['FR'][1]                                  # [T, 112]
 
-            # 接地ラベル (ルート相対化する前のグローバル座標で計算する)
-            contact = compute_foot_contact(pos)                          # [T, 2]
+            # 接地ラベル (mocap はルート相対化する前のグローバル座標で計算する)
+            if self.contact_source == 'pressure':
+                contact = compute_pressure_contact(press_fl, press_fr)   # [T, 2]
+            else:
+                contact = compute_foot_contact(pos)                      # [T, 2]
+
+            # 床の高さをそろえる (接地ラベルを使うので、その後に行う)
+            if self.floor_normalize:
+                floor = estimate_floor(pos, contact)
+                if floor is None:
+                    print(f"  警告: ID={data_id} は接地フレームが少なく床の高さを推定できないため、高さを補正しません")
+                else:
+                    pos = pos.copy()
+                    pos[..., 1] -= floor[:, None]
+                    smpl['trans'] = smpl['trans'].copy()
+                    smpl['trans'][:, 1] -= floor / 1000.0
+                    smpl['joints'] = smpl['joints'].copy()
+                    smpl['joints'][..., 1] -= floor[:, None] / 1000.0
+                    q = np.percentile(floor, [5, 50, 95])
+                    self.floor_info[data_id] = dict(zip(('p5', 'p50', 'p95'), q.round(1).tolist()))
+                    print(f"  床の高さの補正: p5 {q[0]:.0f} / p50 {q[1]:.0f} / p95 {q[2]:.0f} mm")
 
             # ルート (CenterOfGravity) 相対座標へ変換
             # 水平方向 (x, z) のみルート相対にし、鉛直方向 (y) は絶対値を保持する
@@ -496,6 +713,10 @@ class InsoleIMUDataset(Dataset):
             root_pos = pos[:, 0:1, :].copy()
             root_pos[..., 1] = 0.0
             pos = pos - root_pos
+            if data_id in self.heading_info:
+                # SMPL の正解と同じ回転で mocap の関節位置の向きもそろえる (評価で比べるため)
+                pos = pos @ rot_y(-self.heading_info[data_id]).T
+                print(f"  向きの正規化: 骨盤の平均の向き {np.degrees(self.heading_info[data_id]):+.0f}° → 0°")
 
             print(f"  同期: offset={offset:+.2f}s ({info['source']}"
                   + (f", r={info['peak_r']:.2f}" if info.get('peak_r') is not None else '')
@@ -505,7 +726,16 @@ class InsoleIMUDataset(Dataset):
 
             sessions.append(dict(data_id=data_id, key=key, pos=pos, rot=rot,
                                  imu=imu_combined, lp=press_fl, rp=press_fr, contact=contact,
-                                 betas=betas, smpl=smpl))
+                                 betas=betas, smpl=smpl, tpose=tpose))
+
+        # ------------------------------------------------------------------
+        # T ポーズによる IMU の取り付け向きの補正と圧力の体重基準化
+        # ------------------------------------------------------------------
+        self.data_ids = [s['data_id'] for s in sessions]
+        if self.calib['enabled']:
+            self._apply_tpose_calib(sessions)
+        else:
+            self._calib_stats = {s['key']: {'calib_flags': 'disabled'} for s in sessions}
 
         # ------------------------------------------------------------------
         # 被験者キーごとに統計量を計算 (stats が与えられていない場合)
@@ -514,6 +744,9 @@ class InsoleIMUDataset(Dataset):
             for key in sorted({s['key'] for s in sessions}):
                 group = [s for s in sessions if s['key'] == key]
                 self.id_stats[key] = self._compute_group_stats(group)
+                self.id_stats[key].update(self._calib_stats.get(key, {}))
+                self.id_stats[key]['canonical_heading'] = self.canonical_heading
+                self.id_stats[key]['floor_normalize'] = self.floor_normalize
                 print(f"[Dataset] 統計量を計算しました: {key} "
                       f"({[s['data_id'] for s in group]})")
         else:
@@ -522,6 +755,9 @@ class InsoleIMUDataset(Dataset):
                     group = [s for s in sessions if s['key'] == key]
                     print(f"[Dataset] 警告: 統計量に {key} がないため、このデータから計算します")
                     self.id_stats[key] = self._compute_group_stats(group)
+                    self.id_stats[key].update(self._calib_stats.get(key, {}))
+                    self.id_stats[key]['canonical_heading'] = self.canonical_heading
+                    self.id_stats[key]['floor_normalize'] = self.floor_normalize
 
         # ------------------------------------------------------------------
         # seq_len ごとのチャンクに分割
@@ -563,7 +799,7 @@ class InsoleIMUDataset(Dataset):
 
     def _load_smpl(self, data_id, key, betas, num_frames):
         """SMPL の npz を読み、正解の形式に変換する (フレームはスケルトン CSV と同じ)。"""
-        path = os.path.join(self.smpl_dir, f'{data_id}_smpl.npz')
+        path = self._smpl_path(data_id)
         if not os.path.exists(path):
             print(f"  ID={data_id}: {path} がないためスキップ (scripts/fit_smpl.py を実行してください)")
             return None
@@ -582,35 +818,314 @@ class InsoleIMUDataset(Dataset):
                                    offset_mask=z['offset_mask'])
 
         T = num_frames
-        aa = torch.as_tensor(z['poses'], dtype=torch.float32).reshape(T, -1, 3)
-        pose6d = matrix_to_rot6d(axis_angle_to_matrix(aa)).numpy()          # [T, 24, 6]
+        aa = torch.as_tensor(z['poses'], dtype=torch.float64).reshape(T, -1, 3)
+        R = axis_angle_to_matrix(aa)                                        # [T, 24, 3, 3]
         trans = z['trans'].astype(np.float64)
+        joints = z['joints'].astype(np.float64)
+        if self.canonical_heading:
+            # 収録中の骨盤の平均の向きが +z (SMPL の正面) になるよう、世界座標を鉛直軸まわりに回す。
+            # Mag を使わないため絶対的な向きはセンサーから分からず、mocap の世界座標の向きは収録環境しだい
+            # (被験者が -z を向いていると、骨盤を 180° 反転させた局所解に陥り学習が進まない)
+            fwd = R[:, 0, :, 2].numpy()                                     # 骨盤の前方向 (世界座標)
+            yaw = np.arctan2(fwd[:, 0], fwd[:, 2])
+            theta = float(np.arctan2(np.sin(yaw).mean(), np.cos(yaw).mean()))
+            Ry = rot_y(-theta)
+            R[:, 0] = torch.as_tensor(Ry) @ R[:, 0]
+            pelvis = joints[:, 0]                                           # = 骨盤のレスト位置 + 並進
+            trans = pelvis @ Ry.T - (pelvis - trans)
+            joints = joints @ Ry.T
+            self.heading_info[data_id] = theta
+        pose6d = matrix_to_rot6d(R).float().numpy()                         # [T, 24, 6]
         root_h = trans.copy()
         root_h[:, 1] = 0.0                                                  # 水平方向 (x, z) だけ取り除く
         return dict(pose6d=pose6d, trans=trans - root_h,
-                    joints=z['joints'] - root_h[:, None, :])
+                    joints=joints - root_h[:, None, :])
 
     def _resolve_sync_offset(self, data_id, skel_t, skel_pos, sens_t, sens_gyro):
-        """手動指定 > 自動推定 > 0 の優先順でオフセット (秒) を決める。"""
+        """
+        手動指定 > 自動推定 > 0 の優先順でオフセット (秒) を決める。
+        戻り値 : (offset_sec, info)
+            offset_sec は基準のまとまり (sync.groups の先頭) のオフセット。他のまとまりとの差は
+            info['clock_shift_sec'] = {part: 秒} に入れ、呼び出し側でセンサー時刻から引く
+            (補正後はどのセンサーも「スケルトン時刻 t ↔ センサー時刻 t + offset_sec」で対応する)。
+        """
+        no_shift = {p: 0.0 for p in sens_t}
         if data_id in self.sync_manual:
-            return self.sync_manual[data_id], {'offset_sec': self.sync_manual[data_id],
-                                               'source': 'manual', 'peak_r': None}
+            return self.sync_manual[data_id], {'offset_sec': self.sync_manual[data_id], 'source': 'manual',
+                                               'peak_r': None, 'clock_shift_sec': no_shift}
         if not self.sync_enabled:
-            return 0.0, {'offset_sec': 0.0, 'source': 'disabled', 'peak_r': None}
+            return 0.0, {'offset_sec': 0.0, 'source': 'disabled', 'peak_r': None, 'clock_shift_sec': no_shift}
 
-        offset, peak_r, per_part = estimate_sync_offset(
-            skel_t, skel_pos, sens_t, sens_gyro, max_lag_sec=self.sync_max_lag)
-        info = {'offset_sec': offset, 'source': 'auto', 'peak_r': peak_r,
-                'per_sensor': {p: {'offset_sec': o, 'r': r} for p, (o, r) in per_part.items()}}
+        lags, curves = sync_curves(skel_t, skel_pos, sens_t, sens_gyro, max_lag_sec=self.sync_max_lag)
+        per_part = {p: _peak(lags, [c]) for p, c in curves.items()}
+        all_offset, all_r = _peak(lags, list(curves.values()))
         print("  センサー別推定: " + ", ".join(
             f"{p} {o:+.2f}s(r={r:.2f})" for p, (o, r) in per_part.items()))
+
+        # まとまりごとに推定。相関が低いまとまりは全センサー共通の推定値を使う
+        group_res = []
+        for g in self.sync_groups:
+            o, r = _peak(lags, [curves[p] for p in g])
+            fallback = len(self.sync_groups) > 1 and r < self.sync_min_corr
+            if fallback:
+                print(f"  警告: ID={data_id} の {'/'.join(g)} の同期相関が低い (r={r:.2f}) ため、"
+                      f"全センサー共通の推定値 {all_offset:+.2f}s を使います")
+                o = all_offset
+            group_res.append({'parts': g, 'offset_sec': o, 'r': r, 'fallback': fallback})
+        offset, peak_r = group_res[0]['offset_sec'], group_res[0]['r']
+        shift = {p: g['offset_sec'] - offset for g in group_res for p in g['parts']}
+        if len(group_res) > 1:
+            print("  まとまり別: " + ", ".join(
+                f"{'/'.join(g['parts'])} {g['offset_sec']:+.2f}s(r={g['r']:.2f})" for g in group_res)
+                + f" → 時計の補正 " + ", ".join(f"{p} {s:+.2f}s" for p, s in shift.items() if s))
+
+        info = {'offset_sec': offset, 'source': 'auto', 'peak_r': peak_r,
+                'clock_shift_sec': shift,
+                'groups': [{k: v for k, v in g.items()} for g in group_res],
+                'all_sensors': {'offset_sec': all_offset, 'r': all_r},
+                'per_sensor': {p: {'offset_sec': o, 'r': r} for p, (o, r) in per_part.items()}}
         if peak_r < self.sync_min_corr:
             print(f"  警告: ID={data_id} の同期相関が低い (r={peak_r:.2f})。"
                   f"config の sync.offsets で手動指定を検討してください。")
-        if abs(abs(offset) - self.sync_max_lag) < 0.05:
-            print(f"  警告: ID={data_id} の推定値が探索範囲の端 ({offset:+.2f}s) です。"
-                  f"sync.max_lag_sec を広げてください。")
+        for g in group_res:
+            if abs(abs(g['offset_sec']) - self.sync_max_lag) < 0.05:
+                print(f"  警告: ID={data_id} の推定値が探索範囲の端 ({g['offset_sec']:+.2f}s) です。"
+                      f"sync.max_lag_sec を広げてください。")
         return offset, info
+
+    # ------------------------------------------------------------------
+    # キャリブレーション (処理の中身は dataset/calibration.py)
+    # ------------------------------------------------------------------
+    def _static_calib(self, key):
+        """
+        被験者キーに対応する机置きデータ (A0) のキャリブレーション値 (無ければ None)。
+        A0 は収集の直前に 1 回だけ取るので、同じ D?S? → 同じ収集回 D? の他の被験者 の順に探す。
+        """
+        if key in self._a0_cache:
+            return self._a0_cache[key]
+        files = {}
+        for path in glob.glob(os.path.join(self.data_path, 'sensor', 'calib', '*.csv')):
+            m = SENSOR_RE.match(os.path.basename(path))
+            if m and re.search(r'A0$', m.group(1), re.IGNORECASE):
+                files.setdefault(m.group(1).upper(), {})[m.group(2).upper()] = path
+        coll = re.match(r'(D\d+)', key).group(1)
+        same_subject = sorted(d for d in files if subject_key(d) == key)
+        same_collection = sorted(d for d in files if d.startswith(coll + 'S') and d not in same_subject)
+
+        res = None
+        for did in same_subject + same_collection:
+            raw = {p: self._read_sensor_csv(path, with_pressure=(p in calib.FOOT_PARTS))
+                   for p, path in files[did].items()}
+            res = {'source': did, 'parts': calib.static_calibration(raw)}
+            moving = {p: round(c['gyro_p95'], 2) for p, c in res['parts'].items() if c['gyro_p95'] > 5.0}
+            print(f"[Calib] {key}: 机置きデータ {did} を使用 (ジャイロのバイアス "
+                  + ", ".join(f"{p} {np.linalg.norm(c['gyro_bias']):.2f}" for p, c in res['parts'].items())
+                  + " deg/s)")
+            if moving:
+                print(f"  警告: {did} の角速度が大きい部位があります {moving} deg/s (静止していない可能性)")
+            break
+        if res is None:
+            print(f"[Calib] 警告: {key} の机置きデータ (sensor/calib/{coll}S?A0_*.csv) が無いため、"
+                  f"ジャイロのバイアスと圧力のゼロ点は補正しません")
+        self._a0_cache[key] = res
+        return res
+
+    def _apply_static_calib(self, data_id, key, raw):
+        """raw (センサーごとの (t, imu, press)) のジャイロのバイアスと圧力のゼロ点を引いた値に置き換える。"""
+        a0 = self._static_calib(key)
+        info = self.calib_info.setdefault(data_id, {})
+        info['static_calib'] = a0['source'] if a0 else None
+        if a0 is None:
+            return
+        for part, (t, imu, press) in list(raw.items()):
+            c = a0['parts'].get(part)
+            if c is None:
+                print(f"  警告: 机置きデータに {part} が無いため {part} は補正しません")
+                continue
+            if self.calib['gyro_bias']:
+                imu = imu.copy()
+                imu[:, :3] -= c['gyro_bias']
+            if self.calib['pressure_zero'] and press is not None and c['press_zero'] is not None:
+                press = np.clip(press - c['press_zero'], 0.0, None)
+            raw[part] = (t, imu, press)
+
+    def _tpose_candidates(self, sens_t, raw, skel_t, pos, offset):
+        """
+        収録の最初 / 最後の search_sec 秒の静止区間を T ポーズの候補として返す。
+        {'start': [候補, ...], 'end': [...]}。候補は calibration.window_stats の値に
+        mocap_ratio (mocap で T ポーズと判定されたフレームの割合, 確認しないときは None) と
+        verified (True / False / None = 未確認) を加えたもの。mocap での確認は学習時のみ。
+        """
+        tc = self.calib['tpose']
+        lo = max(t[0] for t in sens_t.values())
+        hi = min(t[-1] for t in sens_t.values())
+        span_ref = float(np.percentile(np.linalg.norm(pos[:, 6] - pos[:, 9], axis=1), 99))
+        use_mocap = self.mode == 'train' and tc['mocap_check']
+        out = {}
+        for region, rng in (('start', (lo, min(hi, lo + tc['search_sec']))),
+                            ('end', (max(lo, hi - tc['search_sec']), hi))):
+            cands = []
+            for t0, t1 in calib.find_static_runs(sens_t, raw, rng, tc):
+                w = calib.window_stats(sens_t, raw, t0, t1)
+                if w is None:
+                    continue
+                w['mocap_ratio'] = (calib.mocap_tpose_ratio(skel_t, pos, offset, t0, t1, tc, span_ref)
+                                    if use_mocap else None)
+                w['verified'] = None if w['mocap_ratio'] is None else w['mocap_ratio'] >= tc['mocap_min_ratio']
+                cands.append(w)
+            out[region] = cands
+        return out
+
+    def _tpose_reference(self, sessions):
+        """部位ごとの基準の重力方向 (全被験者共通)。学習時は T ポーズの平均、テスト時は stats の値。"""
+        if self._stats_given:
+            for st in self.id_stats.values():
+                ref = st.get('tpose_gravity_ref')
+                if ref:
+                    return {p: np.asarray(v, dtype=np.float64) for p, v in ref.items()}
+            print("[Calib] 警告: stats に T ポーズの基準が無いため、IMU の取り付け向きは補正しません")
+            return None
+        pool = [w for s in sessions for c in s['tpose'].values() for w in c if w['verified'] is True]
+        if not pool:
+            # mocap で確認できない (mocap_check: false など) ときは各区間の最初の静止区間を使う
+            pool = [c[0] for s in sessions for c in s['tpose'].values() if c]
+            if pool:
+                print("[Calib] 警告: mocap で確認できた T ポーズが無いため、各収録の最初 / 最後の静止区間を"
+                      "基準の計算に使います (腕を下ろした静止が混ざっていないか calib/train.json で確認してください)")
+        if not pool:
+            print("[Calib] 警告: T ポーズが 1 つも見つからないため、IMU の取り付け向きの補正と"
+                  "圧力の体重基準化は行いません (calibration.tpose の設定を確認してください)")
+            return None
+        return {p: calib.mean_direction([w['gravity'][p] for w in pool]) for p in calib.PARTS}
+
+    def _apply_tpose_calib(self, sessions):
+        """
+        T ポーズの採否を決め、IMU の取り付け向きの補正と圧力の体重基準化を sessions にその場で適用する。
+          1. 基準の重力方向 ref (部位ごと) を決める
+          2. 各収録の T ポーズ候補を判定し (mocap で確認済みならその結果、未確認なら ref との角度)、
+             start / end それぞれで最も長いものを選ぶ。prefer の側を優先して使う
+          3. T ポーズが無い収録は被験者の平均 (学習時は他の収録、テスト時は stats) で代用する
+          4. 重力方向を ref に移す最小回転を Gyro と Acc に掛け、圧力を T ポーズの合計で割る
+        """
+        cc, tc = self.calib, self.calib['tpose']
+        ref = self._tpose_reference(sessions)
+        order = ('start', 'end') if tc['prefer'] == 'start' else ('end', 'start')
+
+        for s in sessions:
+            best = {}
+            for region in ('start', 'end'):
+                accepted = []
+                for w in s['tpose'][region]:
+                    w['angle_to_ref'] = ({p: calib.angle_deg(w['gravity'][p], ref[p]) for p in calib.PARTS}
+                                         if ref else None)
+                    if w['verified'] is not None:
+                        w['accepted'] = bool(w['verified'])
+                    else:
+                        w['accepted'] = ref is not None and max(w['angle_to_ref'].values()) <= tc['max_angle_deg']
+                    if w['accepted']:
+                        accepted.append(w)
+                best[region] = max(accepted, key=lambda w: w['t'][1] - w['t'][0]) if accepted else None
+            s['tpose_best'] = best
+            s['tpose_used'] = next(((r, best[r]) for r in order if best[r] is not None), None)
+
+        # 被験者ごとの平均 (T ポーズが無い収録の代用と、テスト時のために stats に保存する)
+        fallback = {}
+        for key in sorted({s['key'] for s in sessions}):
+            st = self.id_stats.get(key) if self._stats_given else None
+            if st is not None and 'tpose_gravity' in st:
+                g = st.get('tpose_gravity')
+                fallback[key] = {
+                    'gravity': {p: np.asarray(v, dtype=np.float64) for p, v in g.items()} if g else None,
+                    'press': st.get('tpose_press'),
+                    'source': '学習データの平均 (stats)'}
+            else:
+                used = [s['tpose_used'][1] for s in sessions if s['key'] == key and s['tpose_used']]
+                fallback[key] = {
+                    'gravity': ({p: calib.mean_direction([w['gravity'][p] for w in used]) for p in calib.PARTS}
+                                if used else None),
+                    'press': ({f: float(np.mean([w['press'][f] for w in used])) for f in calib.FOOT_PARTS}
+                              if used else None),
+                    'source': f"他の収録の平均 ({len(used)} 収録)"}
+            self._calib_stats[key] = {
+                'calib_flags': calib.config_flags(cc),
+                'tpose_gravity_ref': ref,
+                'tpose_gravity': fallback[key]['gravity'],
+                'tpose_press': fallback[key]['press'],
+            }
+
+        imu_order = ('AL', 'AR', 'FL', 'FR', 'BC')   # imu_combined の並び
+        for s in sessions:
+            fb = fallback[s['key']]
+            if s['tpose_used']:
+                region, w = s['tpose_used']
+                gravity, press, source = w['gravity'], w['press'], f"T ポーズ ({region})"
+            elif fb['gravity'] is not None:
+                gravity, press, source = fb['gravity'], fb['press'], f"T ポーズ無し → {fb['source']}"
+            else:
+                gravity, press, source = None, None, 'T ポーズ無し → 補正しない'
+
+            align_deg = {}
+            if cc['imu_align'] and gravity is not None and ref is not None:
+                for i, p in enumerate(imu_order):
+                    R = calib.rotation_between(gravity[p], ref[p])
+                    s['imu'][:, i, 0:3] = s['imu'][:, i, 0:3] @ R.T   # Gyro
+                    s['imu'][:, i, 3:6] = s['imu'][:, i, 3:6] @ R.T   # Acc
+                    align_deg[p] = round(calib.angle_deg(gravity[p], ref[p]), 2)
+
+            scale = None
+            if cc['pressure_scale'] != 'none' and press:
+                if cc['pressure_scale'] == 'total' and press['FL'] + press['FR'] > 0:
+                    # 左右の合計 (≒ 体重) を 100 とする
+                    scale = {f: 100.0 / (press['FL'] + press['FR']) for f in calib.FOOT_PARTS}
+                elif cc['pressure_scale'] == 'per_foot' and min(press.values()) > 0:
+                    scale = {f: 50.0 / press[f] for f in calib.FOOT_PARTS}
+                if scale:
+                    s['lp'] = s['lp'] * scale['FL']
+                    s['rp'] = s['rp'] * scale['FR']
+
+            slip = None
+            if s['tpose_best']['start'] and s['tpose_best']['end']:
+                # 最初と最後の T ポーズの重力方向の差 (バンドのずれ・姿勢の違いの目安)
+                slip = {p: round(calib.angle_deg(s['tpose_best']['start']['gravity'][p],
+                                                 s['tpose_best']['end']['gravity'][p]), 2)
+                        for p in calib.PARTS}
+
+            def _cand_info(w):
+                return {'t_sec': [round(w['t'][0], 2), round(w['t'][1], 2)],
+                        'mocap_ratio': None if w['mocap_ratio'] is None else round(w['mocap_ratio'], 3),
+                        'accepted': w['accepted'],
+                        'angle_to_ref_deg': ({p: round(v, 2) for p, v in w['angle_to_ref'].items()}
+                                             if w['angle_to_ref'] else None),
+                        'press_sum': {f: round(v, 1) for f, v in w['press'].items()}}
+
+            info = self.calib_info.setdefault(s['data_id'], {})
+            info.update({
+                'source': source,
+                'tpose_candidates': {r: [_cand_info(w) for w in s['tpose'][r]] for r in ('start', 'end')},
+                'imu_align_deg': align_deg or None,
+                'pressure_scale': {f: round(v, 6) for f, v in scale.items()} if scale else None,
+                'start_end_diff_deg': slip,
+            })
+
+            msg = f"[Calib] {s['data_id']}: {source}"
+            if s['tpose_used']:
+                w = s['tpose_used'][1]
+                msg += f" {w['t'][0]:.2f}〜{w['t'][1]:.2f}s"
+                if w['mocap_ratio'] is not None:
+                    msg += f" (mocap で確認 {w['mocap_ratio']:.0%})"
+            print(msg)
+            if align_deg:
+                print("  取り付け向きの補正角: " + ", ".join(f"{p} {v:.1f}°" for p, v in align_deg.items()))
+            if press:
+                print(f"  T ポーズの圧力合計: 左 {press['FL']:.0f} / 右 {press['FR']:.0f}")
+            if slip:
+                print("  最初と最後の T ポーズの重力方向の差: " + ", ".join(f"{p} {v:.1f}°" for p, v in slip.items()))
+            rejected = [(r, w) for r in ('start', 'end') for w in s['tpose'][r] if not w['accepted']]
+            for r, w in rejected:
+                why = (f"mocap で T ポーズと判定されたのは {w['mocap_ratio']:.0%}" if w['mocap_ratio'] is not None
+                       else (f"基準との角度差 最大 {max(w['angle_to_ref'].values()):.0f}°" if w['angle_to_ref']
+                             else '基準なし'))
+                print(f"  不採用の静止区間 ({r}) {w['t'][0]:.2f}〜{w['t'][1]:.2f}s: {why}")
 
     @staticmethod
     def _compute_group_stats(group):
@@ -665,9 +1180,13 @@ class InsoleIMUDataset(Dataset):
 
 
 def get_dataloader(data_path, batch_size=32, seq_len=64, mode='train',
-                   num_workers=0, stats=None, sync_cfg=None, target='skeleton', smpl_cfg=None):
+                   num_workers=0, stats=None, sync_cfg=None, target='skeleton', smpl_cfg=None,
+                   calib_cfg=None, ids=None, contact_source='pressure', canonical_heading=True,
+                   floor_normalize=True):
     dataset = InsoleIMUDataset(data_path, seq_len=seq_len, mode=mode, stats=stats,
-                               sync_cfg=sync_cfg, target=target, smpl_cfg=smpl_cfg)
+                               sync_cfg=sync_cfg, target=target, smpl_cfg=smpl_cfg,
+                               calib_cfg=calib_cfg, ids=ids, contact_source=contact_source,
+                               canonical_heading=canonical_heading, floor_normalize=floor_normalize)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -684,7 +1203,11 @@ if __name__ == '__main__':
     loader = get_dataloader(str(get_paths(cfg).data_dir), batch_size=2,
                             seq_len=cfg['dataset'].get('seq_len', 200), mode='train',
                             sync_cfg=cfg.get('sync'), target=cfg['dataset'].get('target', 'skeleton'),
-                            smpl_cfg=cfg.get('smpl'))
+                            smpl_cfg=cfg.get('smpl'), calib_cfg=cfg.get('calibration'),
+                            ids=cfg['dataset'].get('train_ids'),
+                            contact_source=cfg['dataset'].get('contact_source', 'pressure'),
+                            canonical_heading=cfg['dataset'].get('canonical_heading', True),
+                            floor_normalize=cfg['dataset'].get('floor_normalize', True))
     print(f"Dataset size: {len(loader.dataset)} sequences")
     print(f"Stats keys  : {list(loader.dataset.id_stats.keys())}")
     print(f"Sync        : { {k: round(v['offset_sec'], 2) for k, v in loader.dataset.sync_info.items()} }")

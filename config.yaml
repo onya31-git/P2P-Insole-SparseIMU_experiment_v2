@@ -6,12 +6,30 @@ paths:
                                # (target: skeleton の従来の結果は outputs/ に残してある)
 
 dataset:
+  # 学習 / テストに使う収録 ID のリスト (ワイルドカード可。例 ["D2S1A*"], ["D1S1A1", "D1S1A2"])
+  #   指定すると data/{sensor,skeleton,smpl}/ の train/・test/ のどちらにあっても ID で探す。
+  #   null なら従来どおり train/ (学習) と test/ (テスト) のフォルダにある収録をすべて使う。
+  #   train.py / test.py の --ids で一時的に上書きできる
+  train_ids: null
+  test_ids: null
   seq_len: 200
   num_workers: 0
   # 学習の正解の形式
   #   skeleton : mocap の 18 関節の位置 + 回転 (従来の方式)
   #   smpl     : SMPL のパラメータ (data/smpl/ の npz。scripts/fit_smpl.py で作成)
   target: smpl
+  # 接地ラベル (正解) の作り方
+  #   pressure : インソール圧力の合計から判定 (足を上げたときの圧力を基準にした閾値。D1 では mocap の判定と κ 0.83 で一致)
+  #   mocap    : mocap の足の高さと速さから判定 (従来の方式)。D2 は mocap の高さが収録中にドリフトし、
+  #              歩行・ジョグで体の位置がその場に固定されている (立脚中の足が後ろへ動く) ため使えない
+  contact_source: pressure
+  # target: smpl のとき、収録ごとに骨盤の平均の向きが +z (SMPL の正面) になるよう正解を鉛直軸まわりに回す。
+  #   Mag を使わないので絶対的な向きはセンサーから分からない。mocap では被験者が -z (約 170°) を向いており、
+  #   D2 では骨盤を 180° 反転させた局所解に陥って学習が進まなかった (MPJPE 71 mm, 回転誤差 39°)
+  canonical_heading: true
+  # target: smpl のとき、接地中の足の高さから mocap の床の高さを推定して正解の高さから引く (前後 10 秒の中央値)。
+  #   D2 は床の高さが収録ごとに約 50 mm 違い、収録中にもドリフトしていた (並進 y の誤差 41 mm の原因)
+  floor_normalize: true
 
 # SMPL 人体モデル
 smpl:
@@ -24,6 +42,9 @@ smpl:
     D1S1:
       gender: male           # ※ 仮の値。被験者に合わせて male / female / neutral を設定する
       betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # ※ 仮の値 (平均体型)。収集した β に置き換える
+    D2S1:                    # 2026-11-16 の収集 (D1S1 と同じ被験者のため同じ値)
+      gender: male           # ※ 仮の値
+      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # ※ 仮の値
 
 # SMPL フィッティング (scripts/fit_smpl.py)
 fit_smpl:
@@ -52,13 +73,43 @@ sync:
   enabled: true        # false にするとオフセット 0 (先頭合わせ)
   max_lag_sec: 5.0     # 探索範囲 ±秒
   min_corr: 0.3        # 推定相関がこれ未満なら警告
-  offsets: {}          # 手動指定 (自動推定より優先) 例: {D1S1A1: -0.70}
+  offsets: {}          # 手動指定 (自動推定より優先。全センサー共通) 例: {D1S1A1: -0.70}
+  # 同じ時計を共有するセンサーのまとまり。まとまりごとにオフセットを推定し、時計のずれを補正する
+  #   (D2 ではインソール FL / FR の時刻だけ腕・背中の IMU より約 0.5 秒ずれていた)
+  #   [[AL, AR, BC, FL, FR]] にすると全センサーで 1 つのオフセット (従来の方式)
+  groups: [[AL, AR, BC], [FL, FR]]
+
+# センサーのキャリブレーション (dataset/calibration.py)
+#   前提: 収集の直前に 1 回、全センサーを机に置いた静止記録 (sensor/calib/D?S?A0_*.csv) を取り、
+#         各収録の最初と最後に T ポーズを 3 秒キープする。地磁気 (Mag) は信頼度が低いため使わない
+#   結果は <output_dir>/calib/{train,test}.json。設定を変えたら再学習が必要 (テスト時に学習時の設定と照合する)
+#   ※ D2S1 (T ポーズ約 5 秒) では有効にすると改善した (D2S1A* で学習 / D2S1T1 でテスト, 3 シード平均
+#     MPJPE 40.3 → 34.5 mm, 並進 y の誤差 23.5 → 15.4 mm, 回転誤差もわずかに改善。IMU の補正だけで 35.5,
+#     圧力の補正だけで 36.5 mm。結果は outputs/exp_d2/)。
+#     D1S1 (T ポーズ 1 秒前後, A3 は T ポーズ無し) では悪化した (26.4 → 28.1 mm, outputs/exp_tpose_calib/。
+#     同期・向き・床の高さの処理を入れる前の比較)
+calibration:
+  enabled: true
+  gyro_bias: true          # 机置きデータの平均角速度をジャイロのバイアスとして引く
+  pressure_zero: true      # 机置きデータの圧力 (無負荷) をセルごとのゼロ点として引く
+  imu_align: true          # T ポーズ中の重力方向を基準にそろえ、IMU の取り付け向き (傾きの 2 自由度) を補正する
+  pressure_scale: total    # T ポーズの圧力合計で割る。total: 左右の合計 (体重) / per_foot: 左右それぞれ / none
+  tpose:
+    search_sec: 10.0       # 収録の最初 / 最後の何秒から T ポーズを探すか
+    min_sec: 0.5           # 静止区間の最短 [s] (既存データは T ポーズが 1 秒前後と短いため 0.5。
+                           #   3 秒キープのデータだけになったら 2.0 程度に上げると誤検出が減る)
+    gyro_thresh: 20.0      # 静止とみなす角速度の上限 [deg/s] (全 IMU。T ポーズ中も腕は 10 deg/s 程度揺れる)
+    acc_tol: 0.1           # 静止とみなす加速度の大きさと重力の差 (重力に対する比)
+    prefer: start          # start: 最初の T ポーズを使う (無ければ最後) / end: その逆
+    max_angle_deg: 45.0    # mocap で確認できないとき、基準の重力方向との差がこれ以内なら T ポーズとみなす
+    mocap_check: true      # 学習時に mocap の腕の向きで T ポーズかどうかを確認する (テスト時はセンサーのみで判定)
 
 training:
   batch_size: 32
   learning_rate: 0.0001
   num_epochs: 100
   cycle_loss_weight: 0.1
+  seed: null           # 乱数シード (比較実験用。null なら固定しない)
 
 test:
   batch_size: 1

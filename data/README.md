@@ -3,20 +3,23 @@
 ```
 data/
 ├── raw/                         生データ (収録したまま。編集しない)
-│   └── 20261101DC_newInsole/
-│       ├── sensor/<デバイスID>/<録画>/<録画>.data.csv, .meta.json
-│       └── skeleton/{csv,bvh}/skeleton1〜4.*
+│   ├── 20261101DC_atsuya/       D1 (旧フォルダ名 20261101DC_newInsole)
+│   │   ├── sensor/<デバイスID>/<録画>/<録画>.data.csv, .meta.json
+│   │   └── skeleton/{csv,bvh}/skeleton1〜4.*
+│   └── 20261116DC_atsuya2/      D2
+│       ├── sensor/<デバイスID>/<録画>/...
+│       └── skeleton/{csv,bvh}/skeleton1〜5.*
 ├── smpl/                        SMPL 形式のデータセット (scripts/fit_smpl.py が BVH から作成, git 管理外)
-│   ├── train/   D1S1A1〜A3_smpl.npz
-│   ├── test/    D1S1T1_smpl.npz
+│   ├── train/   D1S1A1〜A3_smpl.npz, D2S1A1〜A4_smpl.npz
+│   ├── test/    D1S1T1_smpl.npz, D2S1T1_smpl.npz
 │   └── fit_report.txt           フィッティング誤差のまとめ
 ├── sensor/                      学習用センサーデータ
-│   ├── train/   D1S1A1〜A3_{AL,AR,BC,FL,FR}.csv
-│   ├── test/    D1S1T1_{AL,AR,BC,FL,FR}.csv
-│   └── calib/   D1S1A0_{AL,AR,BC,FL,FR}.csv   (キャリブレーション。学習・テストでは使わない)
+│   ├── train/   D1S1A1〜A3_{AL,AR,BC,FL,FR}.csv, D2S1A1〜A4_*.csv
+│   ├── test/    D1S1T1_{AL,AR,BC,FL,FR}.csv, D2S1T1_*.csv
+│   └── calib/   D1S1A0_*.csv, D2S1A0_*.csv   (机置きデータ。キャリブレーションにだけ使う)
 └── skeleton/                    学習用スケルトン (mocap)
-    ├── train/   D1S1A1〜A3_skeleton.{csv,bvh}
-    └── test/    D1S1T1_skeleton.{csv,bvh}
+    ├── train/   D1S1A1〜A3_skeleton.{csv,bvh}, D2S1A1〜A4_skeleton.*
+    └── test/    D1S1T1_skeleton.{csv,bvh}, D2S1T1_skeleton.*
 ```
 
 `sensor/` と `skeleton/` は `python scripts/prepare_data.py` で `raw/` から再生成できます。
@@ -27,13 +30,38 @@ data/
 |---|---|
 | **D** | データ収集回 (Data collection number) |
 | **S** | 被験者 (Subject number) |
-| **A** | 動作セクション (Action section number)。`A0` はキャリブレーション |
+| **A** | 動作セクション (Action section number)。`A0` は机置きデータ (キャリブレーション用) |
 | **T** | テスト用データ |
 | 部位 | `AL` 左腕 / `AR` 右腕 / `BC` 背中 / `FL` 左足 / `FR` 右足 |
 
 正規化統計量は `D?S?` (収録回 × 被験者) 単位で計算されます。
 
-## 生データとの対応 (20261101DC_newInsole → D1S1)
+## 収録の手順 (キャリブレーション用。2026-11-15 以降の収集から)
+
+- **机置きデータ (`A0`)**: データ収集の直前に 1 回だけ、全センサー (インソールは無負荷) を机に置いて静止させて記録する。
+  データ ID はその収集回の最初の被験者の `D?S?A0` とし、`sensor/calib/` に置く。
+  同じ収集回 `D?` の他の被験者の収録にも、この机置きデータが使われる (ジャイロのバイアスと圧力のゼロ点)。
+- **T ポーズ**: 各収録の最初と最後に T ポーズを 3 秒キープする (IMU の取り付け向きの補正と圧力の体重基準化)。
+  最初の T ポーズを使い、最初が見つからない場合は最後の T ポーズを使う。両方あれば、その差を
+  `outputs/calib/*.json` の `start_end_diff_deg` で確認できる (バンドのずれの目安)。
+- D1S1 は T ポーズが 1 秒前後と短く、センサーの記録開始が mocap より遅いため、A3 には T ポーズが残っていない
+  (他の収録の平均で代用している)。D2S1 からは最初と最後に約 5 秒の T ポーズがある。
+
+## 収集回ごとの注意
+
+- **動作の内容**: A2 の内容が D1 と D2 で異なる。
+  D1: 足踏み + その場でのジョグ / D2: 歩行 + 移動するジョグ (A4 は D2 から)。
+  ただし D2 の mocap でも体の水平位置はほぼ固定 (収録中の重心の移動範囲 0.3 m 程度) で、向きも一定のため、
+  歩行・ジョグでは立脚中の足が後ろへ動く (トレッドミル上と同じ見え方)。並進の水平成分はルート相対にしているので
+  学習には影響しないが、足の速さを使う mocap の接地判定は使えない (`dataset.contact_source: pressure` を使う)。
+- **mocap の高さ**: D2 (特に D2S1T1) は足の高さが収録中に 40〜80 mm ドリフトし、瞬間的な外れ値 (−300 mm 程度) もある。
+- **センサーの時計**: D2 ではインソール (FL / FR, デバイス AB04 / AB00) の時刻だけが腕・背中の IMU より約 0.5 秒ずれている
+  (CSV の記録開始時刻も 0.52 秒早い)。`config.yaml` の `sync.groups` でまとまりごとに同期して補正している
+  (補正量は `outputs/sync/*.json` の `clock_shift_sec`。D2 の 5 収録で −0.48〜−0.54 秒、D1 は −0.05 秒以内)。
+- **圧力の大きさ**: D2 のインソールは D1 より値が約 4 倍大きく、足を上げても合計で約 39000 の荷重が残る
+  (正規化は `D?S?` ごとなので学習には影響しない)。
+
+## 生データとの対応 (20261101DC_atsuya → D1S1)
 
 デバイス → 部位
 
@@ -50,6 +78,19 @@ data/
 | 070352 | skeleton2 | D1S1A2 | train |
 | 071141 | skeleton3 | D1S1A3 | train |
 | 071844 | skeleton4 | D1S1T1 | test |
+
+## 生データとの対応 (20261116DC_atsuya2 → D2S1)
+
+デバイス → 部位は D1 と同じ。
+
+| 録画 (センサー) | スケルトン | データID | 用途 |
+|---|---|---|---|
+| 091606 | なし | D2S1A0 | calib |
+| 093126 | skeleton1 | D2S1A1 | train |
+| 094201 | skeleton2 | D2S1A2 | train |
+| 095129 | skeleton3 | D2S1A3 | train |
+| 100316 | skeleton4 | D2S1T1 | test |
+| 101429 | skeleton5 | D2S1A4 | train |
 
 新しい収録を追加するときは `scripts/prepare_data.py` の `COLLECTIONS` に対応表を追記してください。
 

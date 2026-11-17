@@ -6,10 +6,14 @@
     outputs/
     ├── checkpoints/
     │   ├── model.pth          学習済み重み              (train.py が保存 / test.py が読込)
-    │   └── stats.json         正規化統計量              (train.py が保存 / test.py が読込)
+    │   ├── stats.json         正規化統計量              (train.py が保存 / test.py が読込)
+    │   └── data_ids.json      学習に使った収録 ID       (train.py が保存 / test.py が重複を確認)
     ├── sync/
     │   ├── train.json         学習データの時刻同期結果  (train.py)
     │   └── test.json          テストデータの時刻同期結果 (test.py)
+    ├── calib/
+    │   ├── train.json         学習データのキャリブレーション結果 (train.py)
+    │   └── test.json          テストデータのキャリブレーション結果 (test.py)
     └── results/
         ├── predictions_pos.csv 関節位置の予測と正解      (test.py)
         ├── predictions_rot.csv 関節回転の予測と正解      (test.py)
@@ -45,21 +49,38 @@ def load_config(config_path=DEFAULT_CONFIG):
         return yaml.safe_load(f)
 
 
+def resolve_ids(config, mode, cli_ids=None):
+    """
+    学習 / テストに使う収録 ID を決める。コマンドラインの --ids > config の dataset.{train,test}_ids。
+    どちらも無ければ None (= data/sensor/<mode>/ などのフォルダにある収録をすべて使う)。
+    """
+    if cli_ids:
+        return list(cli_ids)
+    ids = (config.get('dataset') or {}).get(f'{mode}_ids')
+    if isinstance(ids, str):
+        ids = [ids]
+    return list(ids) if ids else None
+
+
 def get_paths(config, makedirs=False):
     """config から入出力パスをまとめて返す。"""
     cfg = config.get('paths', {})
     out = resolve(cfg.get('output_dir', 'outputs'))
     ckpt, sync, results = out / 'checkpoints', out / 'sync', out / 'results'
+    calib = out / 'calib'
     if makedirs:
-        for d in (ckpt, sync, results):
+        for d in (ckpt, sync, results, calib):
             d.mkdir(parents=True, exist_ok=True)
     return SimpleNamespace(
         data_dir=resolve(cfg.get('data_dir', 'data')),
         output_dir=out,
         weights=ckpt / 'model.pth',
         stats=ckpt / 'stats.json',
+        data_ids=ckpt / 'data_ids.json',
         sync_train=sync / 'train.json',
         sync_test=sync / 'test.json',
+        calib_train=calib / 'train.json',
+        calib_test=calib / 'test.json',
         pred_pos=results / 'predictions_pos.csv',
         pred_rot=results / 'predictions_rot.csv',
         pred_contact=results / 'predictions_contact.csv',

@@ -12,8 +12,8 @@
 新しい収録を追加するときは COLLECTIONS に対応表を追記する。
 
 使い方:
-    python scripts/prepare_data.py              # 既存ファイルはスキップ
-    python scripts/prepare_data.py --overwrite  # 既存ファイルも作り直す
+    uv run scripts/prepare_data.py              # 既存ファイルはスキップ
+    uv run scripts/prepare_data.py --overwrite  # 既存ファイルも作り直す
 """
 import sys
 import shutil
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # 収録ごとの対応表
 COLLECTIONS = {
-    '20261101DC_newInsole': {
+    '20261101DC_atsuya': {
         # デバイスID (センサーフォルダ名) -> 装着部位
         'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
         # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
@@ -34,6 +34,20 @@ COLLECTIONS = {
             ('070352', 'skeleton2', 'D1S1A2', 'train'),
             ('071141', 'skeleton3', 'D1S1A3', 'train'),
             ('071844', 'skeleton4', 'D1S1T1', 'test'),
+        ],
+    },
+    # A2 の内容が変わった (D1: 足踏み + その場でのジョグ → D2: 歩行 + 移動するジョグ)
+    '20261116DC_atsuya2': {
+        # デバイスID (センサーフォルダ名) -> 装着部位
+        'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
+        # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
+        'recordings': [
+            ('091606', None,        'D2S1A0', 'calib'),   # キャリブレーション (mocap なし)
+            ('093126', 'skeleton1', 'D2S1A1', 'train'),
+            ('094201', 'skeleton2', 'D2S1A2', 'train'),
+            ('095129', 'skeleton3', 'D2S1A3', 'train'),
+            ('100316', 'skeleton4', 'D2S1T1', 'test'),
+            ('101429', 'skeleton5', 'D2S1A4', 'train'),
         ],
     },
 }
