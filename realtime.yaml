@@ -1,0 +1,57 @@
+# リアルタイム推定 (run_realtime.py) の設定
+#   モデル・正規化・キャリブレーションの設定は config.yaml (オフラインと共通) をそのまま使う。
+#   このファイルはリアルタイム推定だけで使う設定 (オフラインの処理には影響しない)
+
+# センサーサーバー (get_IMU_v4.py と同じ API)
+#   ユーザー名・パスワードは環境変数 NH_USERNAME / NH_PASSWORD で渡す (無ければ起動時に入力)。
+#   ここには書かない (git で共有されるため)
+server:
+  base_url: "https://isensing-s1.u-aizu.ac.jp"
+  app_prefix: "/newhorizons"
+  timeout_sec: 10
+
+# 部位 → デバイス ID。学習データ (D1 / D2) と同じデバイス (data/README.md の対応表)。
+#   別のデバイスに替えると、取り付け位置・個体差の違いで精度が落ちることがある
+devices:
+  AL: "50787D1ADCDC"   # 左腕
+  AR: "F0F5BD5DAED0"   # 右腕
+  BC: "3CDC7545CCC4"   # 背中
+  FL: "80456B76AB04"   # 左足 (インソール, 圧力 + IMU)
+  FR: "80456B76AB00"   # 右足 (インソール, 圧力 + IMU)
+
+# 正規化の統計量と体型 (config.yaml の smpl.subjects) に使う被験者キー (stats.json にあるもの)
+subject: D2S1
+
+# 机置きデータ (ジャイロのバイアス・圧力のゼロ点)
+#   file : data/sensor/calib/ の机置きデータ (D?S?A0) を使う (オフラインと同じ探し方)
+#   live : 起動後に全センサーを机に置いて desk_sec 秒記録する (その後、装着して T ポーズ)
+#   none : 補正しない
+static_calib: file
+desk_sec: 10
+
+# インソールと IMU の時計のずれ [s] (センサー時刻 = timestamp_ms / 1000 - shift)
+#   auto : 学習時の同期結果 (<output_dir>/sync/train.json) の被験者ごとの平均 (D2: インソール -0.51 s)
+#   手動 : {FL: -0.5, FR: -0.5}
+#   ※ mocap との相互相関で推定した値。リアルタイムの受信でも同じだけずれているかは未確認
+clock_shift_sec: auto
+
+# T ポーズのキャリブレーション (IMU の取り付け向き・圧力の体重基準化)
+tpose:
+  auto_start: true     # 全デバイスの受信を確認したらすぐに T ポーズの検出を始める (false: ボタン / Enter で開始)
+  skip: false          # true: T ポーズを使わず学習データの平均で補正する
+  override: {}         # config.yaml の calibration.tpose を上書き (例 {search_sec: 15})
+
+# これ以上データが届かない部位は途切れたとみなし、最後の値のまま進める [s]
+max_wait_sec: 0.3
+
+# 推論 (scripts/realtime_sim.py の評価: 遅延 0.3 s でオフラインと同等の精度)
+inference:
+  window: 200          # 窓の長さ [フレーム, 100 Hz] (学習時の seq_len と同じにする)
+  delay: 30            # 出力の遅延 [フレーム]。0 = 最新 (精度が下がる)
+  hop: 5               # 推論の間隔 [フレーム]。推論が間に合わないときは次の推論でまとめて出力する
+  crossfade: true      # 前回の窓の推定と混ぜて、推論ごとのつなぎ目をなめらかにする
+  device: cuda         # cuda / cpu
+
+viewer:
+  host: 127.0.0.1
+  port: 8766

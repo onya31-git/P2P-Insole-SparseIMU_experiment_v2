@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>リアルタイム推定</title>
+<!-- run_realtime.py が配信する (直接ファイルとして開いても API が無いので動かない) -->
+<style>
+  :root {
+    --bg: #0e1014; --panel: #161920; --panel-2: #1d2129; --line: #2a2f3a;
+    --text: #e7e9ee; --muted: #98a1b0; --faint: #6b7383;
+    --accent: #5b9dff; --warn: #ff7a6b; --ok: #47c98f; --amber: #f0b44c;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+    display: grid; grid-template-columns: minmax(0, 1fr) 320px; grid-template-rows: 46px minmax(0, 1fr);
+    grid-template-areas: "top top" "view side"; height: 100vh; overflow: hidden;
+  }
+  button { font: inherit; color: inherit; }
+  .num { font-variant-numeric: tabular-nums; }
+  header {
+    grid-area: top; display: flex; align-items: center; gap: 16px; padding: 0 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  header .info { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+  .state { margin-left: auto; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+           background: var(--panel-2); border: 1px solid var(--line); }
+  .state.run { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); }
+  .state.tpose, .state.desk, .state.ready { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 50%, var(--line)); }
+  .state.off { color: var(--warn); }
+  #view { grid-area: view; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+  #view canvas { display: block; width: 100%; height: 100%; outline: none; }
+  #banner {
+    position: absolute; left: 50%; top: 18px; transform: translateX(-50%); max-width: 80%;
+    padding: 10px 16px; border-radius: 8px; background: rgba(22, 25, 32, .9); border: 1px solid var(--line);
+    font-size: 14px; text-align: center; display: none;
+  }
+  #banner.on { display: block; }
+  #banner .bar { height: 4px; margin-top: 8px; border-radius: 2px; background: var(--line); overflow: hidden; }
+  #banner .bar i { display: block; height: 100%; width: 0; background: var(--amber); }
+  aside { grid-area: side; background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 12px 14px 20px; }
+  section { margin-bottom: 18px; }
+  h2 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); margin: 0 0 8px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; text-align: right; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 3px 4px; text-align: right; }
+  th { color: var(--faint); font-weight: 500; font-size: 11px; }
+  td:first-child, th:first-child { text-align: left; }
+  td.bad { color: var(--warn); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--faint); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--warn); }
+  .btn { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line);
+         background: var(--panel-2); cursor: pointer; }
+  .btn:hover { border-color: var(--accent); }
+  .contact { display: grid; grid-template-columns: 18px 1fr 40px; gap: 6px; align-items: center; margin: 4px 0; }
+  .contact .track { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
+  .contact .track i { display: block; height: 100%; width: 0; background: var(--accent); }
+  .feet { display: flex; gap: 14px; justify-content: center; }
+  .feet figure { margin: 0; text-align: center; color: var(--muted); font-size: 11px; }
+  .feet canvas { width: 64px; height: 112px; image-rendering: pixelated; border-radius: 4px; background: var(--panel-2); }
+  .note { color: var(--faint); font-size: 11px; margin-top: 6px; }
+  #log { font-size: 11px; color: var(--muted); white-space: pre-wrap; max-height: 140px; overflow-y: auto; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<header>
+  <h1>リアルタイム推定</h1>
+  <span class="info" id="info">読み込み中…</span>
+  <span class="state off" id="state">未接続</span>
+</header>
+<div id="view">
+  <div id="banner"><div id="bannerText"></div><div class="bar"><i id="bannerBar"></i></div></div>
+</div>
+<aside>
+  <section>
+    <button class="btn" id="tposeBtn">T ポーズで再キャリブレーション</button>
+    <div class="note">ボタンを押したら T ポーズを 3 秒以上キープ (データを 10 秒ためて検出します)</div>
+  </section>
+  <section>
+    <h2>遅延・処理</h2>
+    <dl class="kv num">
+      <dt>表示までの遅延</dt><dd id="latency">–</dd>
+      <dt>推論 1 回</dt><dd id="infer">–</dd>
+      <dt>出力の遅延 (設定)</dt><dd id="delay">–</dd>
+      <dt>表示 fps</dt><dd id="fps">–</dd>
+    </dl>
+    <div class="note">表示までの遅延 = センサーの計測時刻 → この画面に表示されるまで (デバイスと PC の時計の差を含む)</div>
+  </section>
+  <section>
+    <h2>デバイス</h2>
+    <table class="num"><thead><tr><th>部位</th><th>受信 [Hz]</th><th>最終 [s]</th></tr></thead><tbody id="devices"></tbody></table>
+  </section>
+  <section>
+    <h2>接地</h2>
+    <div class="contact"><span>左</span><span class="track"><i id="cL"></i></span><span class="num" id="cLv">–</span></div>
+    <div class="contact"><span>右</span><span class="track"><i id="cR"></i></span><span class="num" id="cRv">–</span></div>
+  </section>
+  <section>
+    <h2>圧力 (体重基準化後)</h2>
+    <div class="feet">
+      <figure><canvas id="pFL" width="8" height="14"></canvas><figcaption>左 FL</figcaption></figure>
+      <figure><canvas id="pFR" width="8" height="14"></canvas><figcaption>右 FR</figcaption></figure>
+    </div>
+    <div class="note">8×14 のセル (行 → 横, 列 → 縦に配置。向きは未確認)</div>
+  </section>
+  <section>
+    <h2>キャリブレーション</h2>
+    <dl class="kv" id="calib"><dt>状態</dt><dd>–</dd></dl>
+  </section>
+  <section>
+    <h2>メッセージ</h2>
+    <div id="log"></div>
+  </section>
+</aside>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = (s) => document.querySelector(s);
+const STATE_LABEL = { wait: '受信待ち', desk: '机置き', ready: 'T ポーズ待ち', tpose: 'T ポーズ', run: '推定中' };
+
+// ------------------------------------------------------------------
+// メッシュのデータ
+// ------------------------------------------------------------------
+const model = await (await fetch('/api/model')).json();
+const rest = new Float32Array(model.verts);
+const V = rest.length / 3;
+const skinIdx = new Uint16Array(model.skin_idx);
+const skinW = new Float32Array(model.skin_w);
+const faces = new Uint32Array(model.faces);
+$('#info').textContent = `被験者 ${model.subject} (${model.gender}) · 窓 ${model.window / model.fps} s · ` +
+  `${model.hop / model.fps * 1000} ms ごとに推論`;
+$('#delay').textContent = `${(model.delay / model.fps).toFixed(2)} s`;
+
+// ------------------------------------------------------------------
+// three.js のシーン
+// ------------------------------------------------------------------
+const view = $('#view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+view.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e1014);
+const camera = new THREE.PerspectiveCamera(35, 1, 0.05, 60);
+camera.position.set(1.6, 1.4, 3.4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.9, 0);
+controls.enableDamping = true;
+controls.minDistance = 0.5; controls.maxDistance = 15;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.6));
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(2, 4, 3); scene.add(key);
+const fill = new THREE.DirectionalLight(0xbfd2ff, 0.9); fill.position.set(-3, 2, -2); scene.add(fill);
+const grid = new THREE.GridHelper(8, 32, 0x3a4150, 0x232831); scene.add(grid);
+const floor = new THREE.Mesh(new THREE.CircleGeometry(4, 64), new THREE.MeshBasicMaterial({ color: 0x13161c }));
+floor.rotation.x = -Math.PI / 2; floor.position.y = -0.002; scene.add(floor);
+
+const geo = new THREE.BufferGeometry();
+const posAttr = new THREE.BufferAttribute(new Float32Array(rest), 3).setUsage(THREE.DynamicDrawUsage);
+geo.setAttribute('position', posAttr);
+geo.setIndex(new THREE.BufferAttribute(faces, 1));
+geo.computeVertexNormals();
+const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x5b9dff, roughness: 0.6 }));
+mesh.frustumCulled = false;
+mesh.visible = false;
+scene.add(mesh);
+
+// 足元の接地マーカー (濃さ = 接地確率)
+const FEET = [7, 8];   // 左右の足首
+const marks = FEET.map(() => {
+  const m = new THREE.Mesh(new THREE.CircleGeometry(0.075, 40),
+    new THREE.MeshBasicMaterial({ color: 0x47c98f, transparent: true, depthWrite: false, opacity: 0 }));
+  m.rotation.x = -Math.PI / 2; scene.add(m); return m;
+});
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(view); resize();
+
+// 線形ブレンドスキニング: v' = Σ_k w_k (R_jk v + t_jk)。A は関節ごとの 3x4 (行優先)
+function skin(A) {
+  const out = posAttr.array;
+  for (let v = 0; v < V; v++) {
+    const x = rest[3 * v], y = rest[3 * v + 1], z = rest[3 * v + 2];
+    let ox = 0, oy = 0, oz = 0;
+    for (let k = 0; k < 4; k++) {
+      const w = skinW[4 * v + k]; if (w === 0) continue;
+      const o = skinIdx[4 * v + k] * 12;
+      ox += w * (A[o] * x + A[o + 1] * y + A[o + 2] * z + A[o + 3]);
+      oy += w * (A[o + 4] * x + A[o + 5] * y + A[o + 6] * z + A[o + 7]);
+      oz += w * (A[o + 8] * x + A[o + 9] * y + A[o + 10] * z + A[o + 11]);
+    }
+    out[3 * v] = ox; out[3 * v + 1] = oy; out[3 * v + 2] = oz;
+  }
+  posAttr.needsUpdate = true;
+  geo.computeVertexNormals();
+}
+
+// ------------------------------------------------------------------
+// 受信 (Server-Sent Events) と再生
+//   推定は hop フレームごとにまとめて届くので、少し遅らせて 100 fps で順に表示する (ジッターバッファ)
+// ------------------------------------------------------------------
+const queue = [];            // {k, A, joints, contact, lag, recv}
+const JITTER = model.hop + 3;
+let playK = null, lastTs = null, shownK = null;
+let lastShown = null, fpsCount = 0, fpsT0 = performance.now();
+
+const es = new EventSource('/api/events');
+es.addEventListener('frames', (e) => {
+  const d = JSON.parse(e.data);
+  const recv = performance.now();
+  const n = d.k.length, stride = 24 * 12;
+  for (let i = 0; i < n; i++) {
+    queue.push({ k: d.k[i], A: new Float32Array(d.A.slice(i * stride, (i + 1) * stride)),
+                 joints: d.joints[i], contact: d.contact[i], lag: d.now_ms - d.t[i] * 1000, recv });
+  }
+  if (queue.length > 400) queue.splice(0, queue.length - 400);
+  if (d.pressure) { drawPressure('#pFL', d.pressure.FL); drawPressure('#pFR', d.pressure.FR); }
+});
+es.addEventListener('status', (e) => updateStatus(JSON.parse(e.data)));
+es.onerror = () => { $('#state').className = 'state off'; $('#state').textContent = '切断'; };
+
+function animate(ts) {
+  requestAnimationFrame(animate);
+  controls.update();
+  if (queue.length) {
+    const newest = queue[queue.length - 1].k;
+    if (playK === null || lastTs === null) playK = newest - JITTER;
+    else playK += (ts - lastTs) / 10;                 // 100 fps
+    if (playK > newest) playK = newest;
+    if (playK < newest - 4 * JITTER) playK = newest - JITTER;   // 遅れすぎたら追いつく
+    while (queue.length > 1 && queue[1].k <= playK) queue.shift();
+    const f = queue[0];
+    if (f.k !== shownK) {
+      skin(f.A); mesh.visible = true; shownK = f.k; lastShown = f; fpsCount++;
+      FEET.forEach((j, s) => {
+        marks[s].position.set(f.joints[j][0], 0.001, f.joints[j][2]);
+        marks[s].material.opacity = 0.85 * f.contact[s];
+      });
+      setContact(f.contact);
+    }
+  }
+  lastTs = ts;
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+
+setInterval(() => {
+  const now = performance.now();
+  $('#fps').textContent = `${(fpsCount * 1000 / (now - fpsT0)).toFixed(0)}`;
+  fpsCount = 0; fpsT0 = now;
+  if (lastShown) $('#latency').textContent = `${((lastShown.lag + now - lastShown.recv) / 1000).toFixed(2)} s`;
+}, 500);
+
+function setContact(c) {
+  for (const [i, s] of [[0, 'L'], [1, 'R']]) {
+    $(`#c${s}`).style.width = `${(c[i] * 100).toFixed(0)}%`;
+    $(`#c${s}v`).textContent = c[i].toFixed(2);
+  }
+}
+
+function drawPressure(sel, p) {
+  const ctx = $(sel).getContext('2d');
+  const img = ctx.createImageData(8, 14);
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 14; c++) {
+    const v = Math.min(1, p[r * 14 + c] / 3);     // セルあたりの値 (体重の合計を 100 とした値) 3 で飽和
+    const i = (c * 8 + r) * 4;
+    img.data[i] = 40 + 215 * v; img.data[i + 1] = 44 + 140 * v * v; img.data[i + 2] = 58 * (1 - v) + 30;
+    img.data[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+let logged = '';
+function updateStatus(s) {
+  const st = $('#state');
+  st.className = `state ${s.state}`;
+  st.textContent = STATE_LABEL[s.state] || s.state;
+  $('#infer').textContent = s.infer_ms != null ? `${s.infer_ms.toFixed(0)} ms` : '–';
+  const banner = $('#banner');
+  banner.classList.toggle('on', s.state !== 'run');
+  $('#bannerText').textContent = s.message || '';
+  $('#bannerBar').style.width = s.progress != null ? `${(s.progress * 100).toFixed(0)}%` : '0';
+  $('#bannerBar').parentElement.style.display = s.progress != null ? 'block' : 'none';
+
+  const rows = Object.entries(s.devices || {}).map(([p, d]) => {
+    const bad = d.age_s == null || d.age_s > 0.5;
+    return `<tr><td><span class="dot ${bad ? 'bad' : 'ok'}"></span>${p}</td>` +
+      `<td>${d.rate_hz.toFixed(0)}</td><td class="${bad ? 'bad' : ''}">${d.age_s == null ? '–' : d.age_s.toFixed(1)}</td></tr>`;
+  });
+  $('#devices').innerHTML = rows.join('');
+
+  const c = s.calib;
+  if (c) {
+    const items = [['結果', c.source], ['机置き', c.static || 'なし']];
+    if (c.imu_align_deg) items.push(['向きの補正', Object.entries(c.imu_align_deg).map(([p, v]) => `${p} ${v}°`).join(' ')]);
+    if (c.press_sum) items.push(['圧力合計 L / R', `${c.press_sum.FL.toFixed(0)} / ${c.press_sum.FR.toFixed(0)}`]);
+    $('#calib').innerHTML = items.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  }
+  if (s.log && s.log !== logged) { logged = s.log; $('#log').textContent = s.log; $('#log').scrollTop = 1e9; }
+}
+
+$('#tposeBtn').addEventListener('click', () => fetch('/api/tpose', { method: 'POST' }));
+</script>
+</body>
+</html>

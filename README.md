@@ -29,6 +29,7 @@ uv run visualize.py --end 3000   # 3D 可視化   → ブラウザで visualize.
 uv run visualize.py --mesh --end 600 --step 3   # SMPL のメッシュも表示 (フレーム数は数百程度に絞る)
 uv run scripts/export_mesh.py --end 300         # メッシュを OBJ と AMASS 形式の npz に書き出す
 uv run mesh_viewer.py                           # SMPL メッシュの Web UI → http://127.0.0.1:8765/ (全フレーム再生可)
+uv run scripts/realtime_sim.py --ids D2S1T1     # リアルタイム動作のシミュレーション (窓をずらした推論の遅延と精度) → <output_dir>/realtime/
 ```
 
 `<output_dir>` は `config.yaml` の `paths.output_dir` (既定 `outputs/smpl`)。
@@ -65,6 +66,27 @@ uv run test.py  --ids D2S1T1                   # テストに使う収録
   テストの収録と重なっていると `test.py` が警告します (例: `D1*` は `D1S1T1` も含むので注意)。
 - 存在しない ID を指定すると、使える ID の一覧つきでエラーになります。
 
+### リアルタイム推定
+
+センサーサーバー (NHO プロトコル, `get_IMU_v4.py` と同じ API) から受信したデータで推定し、ブラウザに表示します
+(<http://127.0.0.1:8766/>)。学習済みモデル・`stats.json`・`config.yaml` はオフラインと共通で、
+リアルタイム推定だけの設定は `realtime.yaml` (デバイス ID・被験者・遅延など) にあります。
+
+```bash
+# 認証情報は環境変数で渡す (無ければ起動時に入力)。PowerShell: $env:NH_USERNAME = "..."
+uv run run_realtime.py                    # 受信して推定 → 全デバイスの受信を確認後、T ポーズを 3 秒以上キープ
+uv run run_realtime.py --save --record    # 推定結果 (npz) と受信データ (CSV) を <output_dir>/realtime/live/ に保存
+uv run run_realtime.py --replay D2S1T1    # デバイス無しの動作確認 (収録済みの CSV を実時間で再生)
+```
+
+- 前処理はオフラインと同じ計算を逐次行う: 机置きデータの補正 → 時計のずれの補正 → 100 Hz への補間 →
+  T ポーズ (起動直後の 10 秒から検出。画面のボタンかコンソールの Enter でやり直せる) → 向きの補正・体重基準化・正規化
+- 直近 2 秒の窓で 50 ms ごとに推論し、0.3 秒前のフレームを出力する (`scripts/realtime_sim.py` の評価で
+  オフラインと同等の精度になる遅延)。推論ごとのつなぎ目は前回の推定と混ぜてなめらかにする
+- 画面のメッシュはブラウザ側の線形ブレンドスキニングで変形する (SMPL のポーズ補正は省略)
+- インソールと IMU の時計のずれ (`clock_shift_sec`) は学習時に mocap から推定した値を使っている。
+  受信データを `--record` で保存して mocap と一緒に評価すれば確認できる
+
 ## フォルダ構成
 
 ```
@@ -77,6 +99,8 @@ uv run test.py  --ids D2S1T1                   # テストに使う収録
 ├── visualize.html
 ├── mesh_viewer.py        予測と正解の SMPL メッシュを確認する Web UI のサーバー (target: smpl)
 ├── mesh_viewer.html      その画面 (three.js)
+├── run_realtime.py       リアルタイム推定 (センサーから受信 → 推定 → ブラウザに表示)
+├── realtime.yaml         その設定 (デバイス ID・被験者・遅延など。オフラインの処理には影響しない)
 ├── pyproject.toml        依存ライブラリ (uv)
 ├── uv.lock
 │
@@ -96,10 +120,16 @@ uv run test.py  --ids D2S1T1                   # テストに使う収録
 │   ├── rotation.py       回転表現の変換 (軸角 / 回転行列 / 6D / オイラー角)
 │   ├── bvh.py            BVH の読み込みと順運動学
 │   └── smpl.py           SMPL 人体モデル (順運動学・メッシュ)
+├── realtime/             リアルタイム推定 (run_realtime.py から使う。オフラインの処理は読み込むだけ)
+│   ├── sources.py        センサーサーバー (WebSocket) からの受信 / 収録済み CSV の再生
+│   ├── pipeline.py       逐次の前処理・推論・SMPL の順運動学
+│   ├── viewer.py         表示用の HTTP サーバー (Server-Sent Events)
+│   └── viewer.html       その画面 (three.js)
 ├── scripts/
 │   ├── prepare_data.py   生データ → 学習用データの変換
 │   ├── check_bvh.py      BVH の解釈の確認 (順運動学と CSV の関節位置の比較)
 │   ├── fit_smpl.py       BVH → SMPL パラメータのフィッティング
+│   ├── realtime_sim.py   リアルタイム動作のシミュレーション (オフラインの処理は変更せず読み込むだけ)
 │   └── export_mesh.py    推論結果のメッシュを OBJ / AMASS 形式で書き出す
 │
 ├── body_models/          SMPL のモデル (pkl, git 管理外)

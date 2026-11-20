@@ -83,6 +83,7 @@ build/
 *.pkl
 *.html
 !mesh_viewer.html
+!realtime/viewer.html
 *.js
 !visualize.html
 
