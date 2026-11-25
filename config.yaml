@@ -1,9 +1,10 @@
 # 入出力パス (相対パスはプロジェクトルート基準)
 #   出力ファイルの内訳は README.md / utils/paths.py を参照
 paths:
-  data_dir: "data"        # sensor/ と skeleton/ を含むフォルダ
-  output_dir: "outputs/smpl"   # 学習済み重み・同期結果・予測・評価の保存先
-                               # (target: skeleton の従来の結果は outputs/ に残してある)
+  data_dir: "data" # sensor/ と skeleton/ を含むフォルダ
+  output_dir:
+    "outputs/smpl" # 学習済み重み・同期結果・予測・評価の保存先
+    # (target: skeleton の従来の結果は outputs/ に残してある)
 
 dataset:
   # 学習 / テストに使う収録 ID のリスト (ワイルドカード可。例 ["D2S1A*"], ["D1S1A1", "D1S1A2"])
@@ -33,47 +34,56 @@ dataset:
 
 # SMPL 人体モデル
 smpl:
-  model_dir: "body_models"   # SMPL 公式の pkl を置くフォルダ (git 管理外)
-  data_dir: "data/smpl"      # fit_smpl.py の出力先 ({train,test}/<ID>_smpl.npz)
+  model_dir: "body_models" # SMPL 公式の pkl を置くフォルダ (git 管理外)
+  data_dir: "data/smpl" # fit_smpl.py の出力先 ({train,test}/<ID>_smpl.npz)
   # 被験者ごとの性別と体型パラメータ β (10 次元。足りない分は 0 埋め)
   #   キーは収録 ID の先頭 D?S? (例 D1S1)。β はフィッティングでは固定値として使い、
   #   学習ではモデルへの入力 (body_params) にもなる。
   subjects:
     D1S1:
-      gender: male           # ※ 仮の値。被験者に合わせて male / female / neutral を設定する
-      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # ※ 仮の値 (平均体型)。収集した β に置き換える
-    D2S1:                    # 2026-11-16 の収集 (D1S1 と同じ被験者のため同じ値)
-      gender: male           # ※ 仮の値
-      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # ※ 仮の値
+      gender: male # ※ 仮の値。被験者に合わせて male / female / neutral を設定する
+      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # ※ 仮の値 (平均体型)。収集した β に置き換える
+    D2S1: # 2026-11-16 の収集 (D1S1 と同じ被験者のため同じ値)
+      gender: male # ※ 仮の値
+      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # ※ 仮の値
+    D3S2: # 2026-11-16 の収集 (D1S1 と同じ被験者のため同じ値)
+      gender: male # ※ 仮の値
+      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # ※ 仮の値
+    D4S3: # 2026-11-16 の収集 (D1S1 と同じ被験者のため同じ値)
+      gender: male # ※ 仮の値
+      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # ※ 仮の値
+    D5S4: # 2026-11-16 の収集 (D1S1 と同じ被験者のため同じ値)
+      gender: male # ※ 仮の値
+      betas: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # ※ 仮の値
 
 # SMPL フィッティング (scripts/fit_smpl.py)
 fit_smpl:
   device: cuda
-  offset_stride: 10      # 段階 1 (関節定義の差 = オフセットの推定) で使うフレーム間隔
+  offset_stride: 10 # 段階 1 (関節定義の差 = オフセットの推定) で使うフレーム間隔
   offset_iters: 800
-  pose_iters: 600        # 段階 2 (全フレームの姿勢推定) の反復回数
+  pose_iters: 600 # 段階 2 (全フレームの姿勢推定) の反復回数
   lr: 0.01
   weights:
-    pos: 1.0             # 関節位置 [cm^2]
-    ori: 5.0             # BVH のグローバル回転との差 (ねじれを決める)
-    offset: 0.05         # オフセットの大きさ [cm^2]
-    hinge: 10.0          # 膝・肘の外転方向の回転を抑える
-    prior: 1.0           # 位置の対応が無い関節 (脊椎・つま先) を初期値の近くに保つ
-    smooth: 0.0          # 関節の加速度 [cm/frame^2]^2 (収束を大きく遅らせるため既定は無効)
+    pos: 1.0 # 関節位置 [cm^2]
+    ori: 5.0 # BVH のグローバル回転との差 (ねじれを決める)
+    offset: 0.05 # オフセットの大きさ [cm^2]
+    hinge: 10.0 # 膝・肘の外転方向の回転を抑える
+    prior: 1.0 # 位置の対応が無い関節 (脊椎・つま先) を初期値の近くに保つ
+    smooth: 0.0 # 関節の加速度 [cm/frame^2]^2 (収束を大きく遅らせるため既定は無効)
     # 前腕・手の向き (BVH の前腕のねじれは信頼できないため、既定では使わない。scripts/fit_smpl.py の説明を参照)
-    arm_ori: 0.0         # 肘・手首の BVH のグローバル回転の重み (ori に対する倍率。0 = BVH のねじれを使わない)
-    twist: 1.0           # 肘のねじれ (回内・回外) を中間位 (T ポーズで手のひらが下) に寄せる
-    twist_limit: 100.0   # 肘のねじれが可動域 (回外 85° / 回内 80°) を超えたときの罰
-    wrist: 5.0           # 手首の局所回転 (前腕に対する屈曲・橈尺屈) を BVH に合わせる
+    arm_ori: 0.0 # 肘・手首の BVH のグローバル回転の重み (ori に対する倍率。0 = BVH のねじれを使わない)
+    twist: 1.0 # 肘のねじれ (回内・回外) を中間位 (T ポーズで手のひらが下) に寄せる
+    twist_limit: 100.0 # 肘のねじれが可動域 (回外 85° / 回内 80°) を超えたときの罰
+    wrist: 5.0 # 手首の局所回転 (前腕に対する屈曲・橈尺屈) を BVH に合わせる
 
 # センサーと mocap の時刻同期 (収録ごとにオフセットを自動推定)
 #   センサー時刻 = スケルトン時刻 + offset_sec
 #   推定結果は outputs/sync/{train,test}.json に保存される
 sync:
-  enabled: true        # false にするとオフセット 0 (先頭合わせ)
-  max_lag_sec: 5.0     # 探索範囲 ±秒
-  min_corr: 0.3        # 推定相関がこれ未満なら警告
-  offsets: {}          # 手動指定 (自動推定より優先。全センサー共通) 例: {D1S1A1: -0.70}
+  enabled: true # false にするとオフセット 0 (先頭合わせ)
+  max_lag_sec: 5.0 # 探索範囲 ±秒
+  min_corr: 0.3 # 推定相関がこれ未満なら警告
+  offsets: {} # 手動指定 (自動推定より優先。全センサー共通) 例: {D1S1A1: -0.70}
   # 同じ時計を共有するセンサーのまとまり。まとまりごとにオフセットを推定し、時計のずれを補正する
   #   (D2 ではインソール FL / FR の時刻だけ腕・背中の IMU より約 0.5 秒ずれていた)
   #   [[AL, AR, BC, FL, FR]] にすると全センサーで 1 つのオフセット (従来の方式)
@@ -90,41 +100,42 @@ sync:
 #     同期・向き・床の高さの処理を入れる前の比較)
 calibration:
   enabled: true
-  gyro_bias: true          # 机置きデータの平均角速度をジャイロのバイアスとして引く
-  pressure_zero: true      # 机置きデータの圧力 (無負荷) をセルごとのゼロ点として引く
-  imu_align: true          # T ポーズ中の重力方向を基準にそろえ、IMU の取り付け向き (傾きの 2 自由度) を補正する
-  pressure_scale: total    # T ポーズの圧力合計で割る。total: 左右の合計 (体重) / per_foot: 左右それぞれ / none
+  gyro_bias: true # 机置きデータの平均角速度をジャイロのバイアスとして引く
+  pressure_zero: true # 机置きデータの圧力 (無負荷) をセルごとのゼロ点として引く
+  imu_align: true # T ポーズ中の重力方向を基準にそろえ、IMU の取り付け向き (傾きの 2 自由度) を補正する
+  pressure_scale: total # T ポーズの圧力合計で割る。total: 左右の合計 (体重) / per_foot: 左右それぞれ / none
   tpose:
-    search_sec: 10.0       # 収録の最初 / 最後の何秒から T ポーズを探すか
-    min_sec: 0.5           # 静止区間の最短 [s] (既存データは T ポーズが 1 秒前後と短いため 0.5。
-                           #   3 秒キープのデータだけになったら 2.0 程度に上げると誤検出が減る)
-    gyro_thresh: 20.0      # 静止とみなす角速度の上限 [deg/s] (全 IMU。T ポーズ中も腕は 10 deg/s 程度揺れる)
-    acc_tol: 0.1           # 静止とみなす加速度の大きさと重力の差 (重力に対する比)
-    prefer: start          # start: 最初の T ポーズを使う (無ければ最後) / end: その逆
-    max_angle_deg: 45.0    # mocap で確認できないとき、基準の重力方向との差がこれ以内なら T ポーズとみなす
-    mocap_check: true      # 学習時に mocap の腕の向きで T ポーズかどうかを確認する (テスト時はセンサーのみで判定)
+    search_sec: 10.0 # 収録の最初 / 最後の何秒から T ポーズを探すか
+    min_sec:
+      0.5 # 静止区間の最短 [s] (既存データは T ポーズが 1 秒前後と短いため 0.5。
+      #   3 秒キープのデータだけになったら 2.0 程度に上げると誤検出が減る)
+    gyro_thresh: 20.0 # 静止とみなす角速度の上限 [deg/s] (全 IMU。T ポーズ中も腕は 10 deg/s 程度揺れる)
+    acc_tol: 0.1 # 静止とみなす加速度の大きさと重力の差 (重力に対する比)
+    prefer: start # start: 最初の T ポーズを使う (無ければ最後) / end: その逆
+    max_angle_deg: 45.0 # mocap で確認できないとき、基準の重力方向との差がこれ以内なら T ポーズとみなす
+    mocap_check: true # 学習時に mocap の腕の向きで T ポーズかどうかを確認する (テスト時はセンサーのみで判定)
 
 training:
   batch_size: 32
   learning_rate: 0.0001
   num_epochs: 100
   cycle_loss_weight: 0.1
-  seed: null           # 乱数シード (比較実験用。null なら固定しない)
+  seed: null # 乱数シード (比較実験用。null なら固定しない)
 
 test:
   batch_size: 1
 
 model:
   pressure_encoder:
-    num_sensors: 112     # 圧力センサー 8x14
+    num_sensors: 112 # 圧力センサー 8x14
     in_channels: 1
   imu_encoder:
-    in_features: 6       # Gyro 3 + Acc 3 (Mag は使わない)
+    in_features: 6 # Gyro 3 + Acc 3 (Mag は使わない)
   foot_fusion:
     embed_dim: 128
   lower_body_net:
     feature_dim: 128
-    body_param_dim: 10   # SMPL の β の次元
+    body_param_dim: 10 # SMPL の β の次元
     hidden_dim: 256
     num_layers: 2
     nhead: 8
@@ -138,13 +149,13 @@ model:
   kinematic_fusion:
     upper_dim: 256
     lower_dim: 256
-  pose_decoder:          # target: skeleton のとき
+  pose_decoder: # target: skeleton のとき
     in_features: 512
     num_joints: 18
-  smpl_pose_decoder:     # target: smpl のとき
+  smpl_pose_decoder: # target: smpl のとき
     in_features: 512
     hidden: 256
-    init_trans_y: 1.1    # 並進 y の初期値 [m] (SMPL の骨盤の高さ ≒ 並進 y - 0.24)
+    init_trans_y: 1.1 # 並進 y の初期値 [m] (SMPL の骨盤の高さ ≒ 並進 y - 0.24)
 
 cycle_loss:
   pressure_nodes: 112
@@ -160,10 +171,10 @@ losses:
 
 # 損失の重み (target: smpl)。位置は m, 速度は m/s 単位
 smpl_losses:
-  rot: 1.0          # 局所回転 (回転行列の L1, 手を除く 22 関節)
-  glob_rot: 1.0     # グローバル回転 (順運動学後の回転行列の L1)
-  joint: 5.0        # 関節位置 (SMPL の順運動学, 平均ユークリッド距離 [m])
-  trans: 1.0        # 並進 [m]
-  contact: 0.1      # 接地 (BCE)
-  smooth: 0.1       # 関節速度の差 [m/s]
-  foot_skate: 0.1   # 正解で接地しているフレームの足 (足首・つま先) の速度の誤差 [m/s]
+  rot: 1.0 # 局所回転 (回転行列の L1, 手を除く 22 関節)
+  glob_rot: 1.0 # グローバル回転 (順運動学後の回転行列の L1)
+  joint: 5.0 # 関節位置 (SMPL の順運動学, 平均ユークリッド距離 [m])
+  trans: 1.0 # 並進 [m]
+  contact: 0.1 # 接地 (BCE)
+  smooth: 0.1 # 関節速度の差 [m/s]
+  foot_skate: 0.1 # 正解で接地しているフレームの足 (足首・つま先) の速度の誤差 [m/s]

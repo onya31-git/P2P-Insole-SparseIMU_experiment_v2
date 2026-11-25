@@ -96,7 +96,7 @@ data/smpl/
 *.obj
 
 # prepare_data.py が raw からコピーする BVH (元データは data/raw/ にある)
-data/skeleton/**/*.bvh
+.bvh
 
 # 学習・推論の生成物
 outputs/
