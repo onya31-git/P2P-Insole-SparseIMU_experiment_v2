@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # 収録ごとの対応表
 COLLECTIONS = {
-    '20261101DC_atsuya': {
+    '20261101DC1': {
         # デバイスID (センサーフォルダ名) -> 装着部位
         'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
         # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
@@ -37,7 +37,7 @@ COLLECTIONS = {
         ],
     },
     # A2 の内容が変わった (D1: 足踏み + その場でのジョグ → D2: 歩行 + 移動するジョグ)
-    '20261116DC_atsuya2': {
+    '20261116DC2': {
         # デバイスID (センサーフォルダ名) -> 装着部位
         'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
         # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
@@ -50,7 +50,7 @@ COLLECTIONS = {
             ('101429', 'skeleton5', 'D2S1A4', 'train'),
         ],
     },
-    '20261119DC_yamagishi': {
+    '20261119DC3': {
         # デバイスID (センサーフォルダ名) -> 装着部位
         'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
         # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
@@ -62,7 +62,7 @@ COLLECTIONS = {
             ('082047', 'skeleton4', 'D3S2T1', 'test'),
         ],
     },
-    '20261120DC_yahagi': {
+    '20261120DC4': {
             # デバイスID (センサーフォルダ名) -> 装着部位
             'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
             # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
@@ -73,8 +73,8 @@ COLLECTIONS = {
                 ('072004', 'skeleton3', 'D4S3A3', 'train'),
                 ('072844', 'skeleton4', 'D4S3T1', 'test'),
             ],
-        },
-    '20261123DC_nirupam': {
+    },
+    '20261123DC5': {
             # デバイスID (センサーフォルダ名) -> 装着部位
             'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
             # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
@@ -84,6 +84,30 @@ COLLECTIONS = {
                 ('071227', 'skeleton2', 'D5S4A2', 'train'),
                 ('072058', 'skeleton3', 'D5S4A3', 'train'),
                 ('073009', 'skeleton4', 'D5S4T1', 'test'),
+            ],
+    },
+    '20261126DC6': {
+    # デバイスID (センサーフォルダ名) -> 装着部位
+    'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
+    # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
+    'recordings': [
+        ('070023', None,        'D6S5A0', 'calib'),   # キャリブレーション (mocap なし)
+        ('072315', 'skeleton1', 'D6S5A1', 'train'),
+        ('073230', 'skeleton2', 'D6S5A2', 'train'),
+        ('074055', 'skeleton3', 'D6S5A3', 'train'),
+        ('074922', 'skeleton4', 'D6S5T1', 'test'),
+        ],
+    },
+    '20261127DC7': {
+            # デバイスID (センサーフォルダ名) -> 装着部位
+            'devices': {'DCDC': 'AL', 'AED0': 'AR', 'CCC4': 'BC', 'AB04': 'FL', 'AB00': 'FR'},
+            # (録画フォルダ名, スケルトンCSV名 or None, データID, 保存先 split)
+            'recordings': [
+                ('040345', None,        'D7S6A0', 'calib'),   # キャリブレーション (mocap なし)
+                ('041620', 'skeleton1', 'D7S6A1', 'train'),
+                ('042518', 'skeleton2', 'D7S6A2', 'train'),
+                ('043350', 'skeleton3', 'D7S6A3', 'train'),
+                ('044616', 'skeleton4', 'D7S6T1', 'test'),
             ],
         },
 }
